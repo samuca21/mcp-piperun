@@ -5,7 +5,7 @@ WORKDIR /app
 # Copia apenas o package do subprojeto
 COPY piperun-mcp-server/package*.json ./piperun-mcp-server/
 WORKDIR /app/piperun-mcp-server
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # Copia o código e compila
 COPY piperun-mcp-server/ ./
