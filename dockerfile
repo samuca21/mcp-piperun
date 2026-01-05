@@ -26,4 +26,4 @@ EXPOSE 80
 # Supergateway: stdio -> Streamable HTTP
 # Endpoint padrão: /mcp
 # Health: /healthz
-CMD ["sh", "-lc", "supergateway --stdio \"node build/index.js\" --outputTransport streamableHttp --port ${PORT} --streamableHttpPath /mcp --healthEndpoint /healthz --baseUrl http://localhost:${PORT}"]
+CMD ["sh", "-lc", "supergateway --stdio \"node build/index.js\" --outputTransport streamableHttp --port ${PORT} --streamableHttpPath /mcp --healthEndpoint /healthz --baseUrl http://localhost:${PORT} --cors"]
