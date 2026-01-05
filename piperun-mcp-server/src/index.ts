@@ -327,7 +327,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
     if (!args || typeof args !== 'object' || typeof args.api_token !== 'string' || !args.api_token.trim()) {
       throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'api_token' (string) é obrigatório nos argumentos da ferramenta.");
     }
-    const api_token = args.api_token;
+    const api_token = args?.api_token ?? process.env.PIPERUN_API_TOKEN;
+    if (!api_token) throw new Error("Missing api_token (tool param) or PIPERUN_API_TOKEN (env).");
 
     // Re-adicionar: Remover o token dos argumentos antes de passá-los adiante ou usá-los
     const toolArgs = { ...args };
