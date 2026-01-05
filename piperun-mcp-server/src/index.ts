@@ -3,23 +3,20 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema, // Schema para validação
-  ListToolsRequestSchema, // Schema para validação
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
   McpError,
   ErrorCode,
-  CallToolRequest, // Tipo para o parâmetro da requisição
+  CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
-import axios, { AxiosError } from 'axios';
-
-// 1. (Removido - Token será passado por chamada novamente)
+import axios, { AxiosError } from "axios";
 
 // 2. Configurar instância do Axios (sem token global)
 const PIPERUN_API_BASE_URL = "https://api.pipe.run/v1";
 const axiosInstance = axios.create({
   baseURL: PIPERUN_API_BASE_URL,
   headers: {
-    // O token será adicionado por requisição
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
   },
 });
 
@@ -35,34 +32,60 @@ interface CreatePersonArgs {
 // Função de type guard para validar os argumentos de create_person
 function isValidCreatePersonArgs(args: any): args is CreatePersonArgs {
   return (
-    typeof args === 'object' &&
+    typeof args === "object" &&
     args !== null &&
-    typeof args.name === 'string' && args.name.trim() !== '' &&
-    typeof args.owner_id === 'number' &&
-    (args.email === undefined || typeof args.email === 'string') &&
-    (args.phone === undefined || typeof args.phone === 'string') &&
-    (args.company_id === undefined || typeof args.company_id === 'number')
+    typeof args.name === "string" &&
+    args.name.trim() !== "" &&
+    typeof args.owner_id === "number" &&
+    (args.email === undefined || typeof args.email === "string") &&
+    (args.phone === undefined || typeof args.phone === "string") &&
+    (args.company_id === undefined || typeof args.company_id === "number")
   );
 }
 
 // Interface para validação dos argumentos de create_note
 interface CreateNoteArgs {
-    content: string;
-    deal_id?: number;
-    person_id?: number;
-    company_id?: number;
+  content: string;
+  deal_id?: number;
+  person_id?: number;
+  company_id?: number;
 }
 
 // Função de type guard para validar os argumentos de create_note
 function isValidCreateNoteArgs(args: any): args is CreateNoteArgs {
   return (
-    typeof args === 'object' &&
+    typeof args === "object" &&
     args !== null &&
-    typeof args.content === 'string' && args.content.trim() !== '' &&
-    (typeof args.deal_id === 'number' || typeof args.person_id === 'number' || typeof args.company_id === 'number')
+    typeof args.content === "string" &&
+    args.content.trim() !== "" &&
+    (typeof args.deal_id === "number" ||
+      typeof args.person_id === "number" ||
+      typeof args.company_id === "number")
   );
 }
 
+// Helper: resolve token (tool param tem prioridade, senão env var)
+function resolveApiToken(args: any): string {
+  const fromArgs =
+    args &&
+    typeof args === "object" &&
+    typeof (args as any).api_token === "string" &&
+    (args as any).api_token.trim()
+      ? (args as any).api_token.trim()
+      : "";
+
+  const fromEnv = (process.env.PIPERUN_API_TOKEN || "").trim();
+  const token = fromArgs || fromEnv;
+
+  if (!token) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      "Faltando token: informe 'api_token' nos argumentos da ferramenta OU configure PIPERUN_API_TOKEN no ambiente."
+    );
+  }
+
+  return token;
+}
 
 // 3. Criar o servidor MCP
 const server = new Server(
@@ -79,34 +102,35 @@ const server = new Server(
 
 // 4. Handler para listar as ferramentas disponíveis
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  // Define o schema base para ferramentas de listagem simples (apenas token)
-   const listToolSimpleInputSchema = {
+  // IMPORTANTE:
+  // Deixamos api_token COMO OPCIONAL nos schemas para o n8n não travar exigindo o campo.
+  // O token continua sendo validado no runtime (resolveApiToken).
+
+  const listToolSimpleInputSchema = {
     type: "object",
     properties: {
-      api_token: { type: "string", description: "Token da API do PipeRun" },
+      api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
     },
-    required: ["api_token"]
+    required: [] as string[],
   };
 
-  // Define o schema base para ferramentas de listagem com paginação
   const listToolPaginatedInputSchema = {
     type: "object",
     properties: {
-      api_token: { type: "string", description: "Token da API do PipeRun" },
+      api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
       page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
-      show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" }
+      show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" },
     },
-    required: ["api_token"]
+    required: [] as string[],
   };
 
-  // Define o schema para list_activities (mais complexo)
   const listActivitiesInputSchema = {
     type: "object",
     properties: {
-      api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+      api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
       page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
       show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 15, máx: 200)" },
-      "with": { type: "string", description: "(Opcional) Entidades relacionadas a incluir (ex: 'deal,owner')" },
+      with: { type: "string", description: "(Opcional) Entidades relacionadas a incluir (ex: 'deal,owner')" },
       sort: { type: "string", description: "(Opcional) Coluna para ordenar" },
       desc: { type: "boolean", description: "(Opcional) Ordenar decrescente (true) ou crescente (false)" },
       deal_id: { type: "number", description: "(Opcional) Filtrar por ID da oportunidade" },
@@ -124,95 +148,74 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       updated_at_start: { type: "string", format: "date-time", description: "(Opcional) Data/hora atualização (início período)" },
       updated_at_end: { type: "string", format: "date-time", description: "(Opcional) Data/hora atualização (fim período)" },
     },
-    required: ["api_token"] // Re-adicionado
+    required: [] as string[],
   };
 
   return {
     tools: [
-      // Ferramenta existente: list_deals (atualizada)
       {
         name: "list_deals",
         description: "Recupera uma lista de oportunidades do PipeRun CRM.",
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             pipeline_id: { type: "number", description: "(Opcional) ID do funil para filtrar oportunidades" },
             person_id: { type: "number", description: "(Opcional) ID da pessoa para filtrar oportunidades" },
             page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
-            show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" }
+            show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" },
           },
-          required: ["api_token"] // Re-adicionado
-        }
+          required: [] as string[],
+        },
       },
-      // Ferramenta existente: create_person
       {
         name: "create_person",
         description: "Cria uma nova pessoa (lead/contato) no PipeRun CRM.",
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             name: { type: "string", description: "Nome da pessoa" },
             owner_id: { type: "integer", description: "ID do usuário responsável" },
             email: { type: "string", description: "(Opcional) Email da pessoa" },
             phone: { type: "string", description: "(Opcional) Telefone da pessoa" },
             company_id: { type: "integer", description: "(Opcional) ID da empresa associada" },
           },
-          required: ["api_token", "name", "owner_id"], // Re-adicionado api_token
+          required: ["name", "owner_id"],
         },
       },
-      // Ferramentas de Listagem
-      {
-        name: "list_pipelines",
-        description: "Recupera uma lista de funis do PipeRun CRM.",
-        inputSchema: listToolPaginatedInputSchema
-      },
+
+      // Listagens
+      { name: "list_pipelines", description: "Recupera uma lista de funis do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
       {
         name: "list_stages",
         description: "Recupera uma lista de etapas de funil do PipeRun CRM.",
         inputSchema: {
           type: "object",
           properties: {
-            // api_token é incluído pelo spread abaixo
-            ...listToolPaginatedInputSchema.properties, // Inclui api_token, page, show
-            pipeline_id: { type: "number", description: "(Opcional) ID do funil para filtrar etapas" }
+            ...listToolPaginatedInputSchema.properties,
+            pipeline_id: { type: "number", description: "(Opcional) ID do funil para filtrar etapas" },
           },
-          required: ["api_token"] // api_token vem do spread
-        }
+          required: [] as string[],
+        },
       },
-      {
-        name: "list_items",
-        description: "Recupera uma lista de produtos do PipeRun CRM.",
-        inputSchema: listToolPaginatedInputSchema
-      },
-      {
-        name: "list_users",
-        description: "Recupera uma lista de usuários (vendedores) do PipeRun CRM.",
-        inputSchema: listToolPaginatedInputSchema
-      },
-      {
-        name: "list_activities",
-        description: "Recupera uma lista de atividades do PipeRun CRM.",
-        inputSchema: listActivitiesInputSchema
-      },
-      // Ferramentas de Gerenciamento de Empresas
-      {
-        name: "list_companies",
-        description: "Recupera uma lista de empresas do PipeRun CRM.",
-        inputSchema: listToolPaginatedInputSchema
-      },
+      { name: "list_items", description: "Recupera uma lista de produtos do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
+      { name: "list_users", description: "Recupera uma lista de usuários (vendedores) do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
+      { name: "list_activities", description: "Recupera uma lista de atividades do PipeRun CRM.", inputSchema: listActivitiesInputSchema },
+
+      // Empresas
+      { name: "list_companies", description: "Recupera uma lista de empresas do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
       {
         name: "get_company",
         description: "Recupera os detalhes de uma empresa específica do PipeRun CRM.",
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
-            company_id: { type: "integer", description: "ID da empresa a ser recuperada" }
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            company_id: { type: "integer", description: "ID da empresa a ser recuperada" },
           },
-          required: ["api_token", "company_id"] // Re-adicionado api_token
-        }
+          required: ["company_id"],
+        },
       },
       {
         name: "create_company",
@@ -220,14 +223,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             name: { type: "string", description: "Nome da empresa" },
             owner_id: { type: "integer", description: "ID do usuário responsável" },
             email: { type: "string", description: "(Opcional) Email principal da empresa" },
             phone: { type: "string", description: "(Opcional) Telefone principal da empresa" },
           },
-          required: ["api_token", "name", "owner_id"] // Re-adicionado api_token
-        }
+          required: ["name", "owner_id"],
+        },
       },
       {
         name: "update_company",
@@ -235,65 +238,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             company_id: { type: "integer", description: "ID da empresa a ser atualizada" },
             name: { type: "string", description: "(Opcional) Novo nome da empresa" },
             owner_id: { type: "integer", description: "(Opcional) Novo ID do usuário responsável" },
             email: { type: "string", description: "(Opcional) Novo email principal da empresa" },
             phone: { type: "string", description: "(Opcional) Novo telefone principal da empresa" },
           },
-          required: ["api_token", "company_id"] // Re-adicionado api_token
-        }
+          required: ["company_id"],
+        },
       },
-      // Ferramentas de Contexto e Classificação
-       {
+
+      // Contexto / Classificação
+      {
         name: "list_custom_fields",
         description: "Recupera uma lista de campos customizados do PipeRun CRM.",
         inputSchema: {
-           type: "object",
-           properties: {
-             api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
-             // entity: { type: "string", description: "(Opcional) Filtrar por entidade (ex: 'Deal', 'Person', 'Company')" }
-           },
-           required: ["api_token"] // Re-adicionado
-         }
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+          },
+          required: [] as string[],
+        },
       },
-      {
-        name: "list_tags",
-        description: "Recupera uma lista de tags do PipeRun CRM.",
-        inputSchema: listToolSimpleInputSchema
-      },
-      {
-        name: "list_loss_reasons",
-        description: "Recupera uma lista de motivos de perda do PipeRun CRM.",
-        inputSchema: listToolSimpleInputSchema
-      },
-      {
-        name: "list_deal_sources",
-        description: "Recupera uma lista de origens de oportunidades do PipeRun CRM.",
-        inputSchema: listToolSimpleInputSchema
-      },
-      {
-        name: "list_activity_types",
-        description: "Recupera uma lista de tipos de atividades do PipeRun CRM.",
-        inputSchema: listToolSimpleInputSchema
-      },
-      // Ferramentas de Gerenciamento de Notas
+      { name: "list_tags", description: "Recupera uma lista de tags do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
+      { name: "list_loss_reasons", description: "Recupera uma lista de motivos de perda do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
+      { name: "list_deal_sources", description: "Recupera uma lista de origens de oportunidades do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
+      { name: "list_activity_types", description: "Recupera uma lista de tipos de atividades do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
+
+      // Notas
       {
         name: "list_notes",
         description: "Recupera uma lista de notas do PipeRun CRM.",
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
             show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" },
             deal_id: { type: "number", description: "(Opcional) Filtrar por ID da oportunidade" },
             person_id: { type: "number", description: "(Opcional) Filtrar por ID da pessoa" },
             company_id: { type: "number", description: "(Opcional) Filtrar por ID da empresa" },
           },
-          required: ["api_token"] // Re-adicionado
-        }
+          required: [] as string[],
+        },
       },
       {
         name: "create_note",
@@ -301,68 +289,72 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            api_token: { type: "string", description: "Token da API do PipeRun" }, // Re-adicionado
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
             content: { type: "string", description: "Conteúdo da nota" },
             deal_id: { type: "number", description: "(Opcional) ID da oportunidade para associar a nota" },
             person_id: { type: "number", description: "(Opcional) ID da pessoa para associar a nota" },
             company_id: { type: "number", description: "(Opcional) ID da empresa para associar a nota" },
           },
-          required: ["api_token", "content"] // Re-adicionado api_token
-        }
-      }
-    ] // Fim do array tools
-  }; // Fim do objeto de retorno
-}); // Fim do setRequestHandler
+          required: ["content"],
+        },
+      },
+    ],
+  };
+});
 
 // 5. Handler para chamar as ferramentas
 server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
-  // Declarar 'name' aqui para estar acessível no catch
-  let name: string = '';
+  let name = "";
   try {
-    // Atribuir valor a 'name' dentro do try
     name = request.params.name;
     const args = request.params.arguments;
 
-    // Re-adicionar: Validar e extrair o token da API dos argumentos
-    if (!args || typeof args !== 'object' || typeof args.api_token !== 'string' || !args.api_token.trim()) {
-      throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'api_token' (string) é obrigatório nos argumentos da ferramenta.");
-    }
-    const api_token = args?.api_token ?? process.env.PIPERUN_API_TOKEN;
-    if (!api_token) throw new Error("Missing api_token (tool param) or PIPERUN_API_TOKEN (env).");
+    const api_token = resolveApiToken(args);
 
-    // Re-adicionar: Remover o token dos argumentos antes de passá-los adiante ou usá-los
-    const toolArgs = { ...args };
-    delete toolArgs.api_token; // Não passar o token para a API do PipeRun como parâmetro de negócio
+    // toolArgs: copia args (se existir) e remove api_token
+    const toolArgs: Record<string, any> =
+      args && typeof args === "object" ? { ...(args as any) } : {};
+    delete toolArgs.api_token;
 
-    // Re-adicionar: Criar headers específicos para esta requisição
     const requestHeaders = {
-        'token': api_token,
-        'Content-Type': 'application/json',
+      token: api_token,
+      "Content-Type": "application/json",
     };
 
     switch (name) {
       case "list_deals": {
-        const response = await axiosInstance.get('/deals', { params: toolArgs, headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        const response = await axiosInstance.get("/deals", {
+          params: toolArgs,
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
       case "create_person": {
-        const personArgs = toolArgs;
-        if (!isValidCreatePersonArgs(personArgs)) {
-           throw new McpError(ErrorCode.InvalidParams, "Argumentos inválidos para create_person. 'name' (string) e 'owner_id' (number) são obrigatórios.");
+        if (!isValidCreatePersonArgs(toolArgs)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Argumentos inválidos para create_person. 'name' (string) e 'owner_id' (number) são obrigatórios."
+          );
         }
         const personData: Partial<CreatePersonArgs> = {
-            name: personArgs.name,
-            owner_id: personArgs.owner_id,
+          name: toolArgs.name,
+          owner_id: toolArgs.owner_id,
+          ...(toolArgs.email ? { email: toolArgs.email } : {}),
+          ...(toolArgs.phone ? { phone: toolArgs.phone } : {}),
+          ...(toolArgs.company_id ? { company_id: toolArgs.company_id } : {}),
         };
-        if (personArgs.email) personData.email = personArgs.email;
-        if (personArgs.phone) personData.phone = personArgs.phone;
-        if (personArgs.company_id) personData.company_id = personArgs.company_id;
-        const response = await axiosInstance.post('/persons', personData, { headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        const response = await axiosInstance.post("/persons", personData, {
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
-      // Casos para ferramentas de listagem genéricas
+      // Listagens genéricas
       case "list_pipelines":
       case "list_stages":
       case "list_items":
@@ -375,104 +367,139 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case "list_activity_types":
       case "list_custom_fields":
       case "list_notes": {
-        let endpoint = '';
-        switch(name) {
-            case "list_pipelines": endpoint = '/pipelines'; break;
-            case "list_stages": endpoint = '/stages'; break;
-            case "list_items": endpoint = '/items'; break;
-            case "list_users": endpoint = '/users'; break;
-            case "list_activities": endpoint = '/activities'; break;
-            case "list_companies": endpoint = '/companies'; break;
-            case "list_tags": endpoint = '/tags'; break;
-            case "list_loss_reasons": endpoint = '/loss-reasons'; break;
-            case "list_deal_sources": endpoint = '/deal-sources'; break;
-            case "list_activity_types": endpoint = '/activity-types'; break;
-            case "list_custom_fields": endpoint = '/custom-fields'; break;
-            case "list_notes": endpoint = '/notes'; break;
-            default: throw new McpError(ErrorCode.MethodNotFound, `Mapeamento de endpoint não encontrado para: ${name}`);
+        let endpoint = "";
+        switch (name) {
+          case "list_pipelines": endpoint = "/pipelines"; break;
+          case "list_stages": endpoint = "/stages"; break;
+          case "list_items": endpoint = "/items"; break;
+          case "list_users": endpoint = "/users"; break;
+          case "list_activities": endpoint = "/activities"; break;
+          case "list_companies": endpoint = "/companies"; break;
+          case "list_tags": endpoint = "/tags"; break;
+          case "list_loss_reasons": endpoint = "/loss-reasons"; break;
+          case "list_deal_sources": endpoint = "/deal-sources"; break;
+          case "list_activity_types": endpoint = "/activity-types"; break;
+          case "list_custom_fields": endpoint = "/custom-fields"; break;
+          case "list_notes": endpoint = "/notes"; break;
+          default:
+            throw new McpError(
+              ErrorCode.MethodNotFound,
+              `Mapeamento de endpoint não encontrado para: ${name}`
+            );
         }
-        const response = await axiosInstance.get(endpoint, { params: toolArgs, headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        const response = await axiosInstance.get(endpoint, {
+          params: toolArgs,
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
-      // Casos para Gerenciamento de Empresas (GET, POST, PUT)
       case "get_company": {
-        if (!toolArgs || typeof toolArgs.company_id !== 'number') {
-          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'company_id' (number) é obrigatório para get_company.");
+        if (typeof toolArgs.company_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "O parâmetro 'company_id' (number) é obrigatório para get_company."
+          );
         }
         const company_id = toolArgs.company_id;
         const queryArgs = { ...toolArgs };
         delete queryArgs.company_id;
-        const response = await axiosInstance.get(`/companies/${company_id}`, { params: queryArgs, headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+
+        const response = await axiosInstance.get(`/companies/${company_id}`, {
+          params: queryArgs,
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
       case "create_company": {
-        const response = await axiosInstance.post('/companies', toolArgs, { headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        const response = await axiosInstance.post("/companies", toolArgs, {
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
       case "update_company": {
-        if (!toolArgs || typeof toolArgs.company_id !== 'number') {
-          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'company_id' (number) é obrigatório para update_company.");
+        if (typeof toolArgs.company_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "O parâmetro 'company_id' (number) é obrigatório para update_company."
+          );
         }
         const company_id = toolArgs.company_id;
         const updateData = { ...toolArgs };
         delete updateData.company_id;
+
         if (Object.keys(updateData).length === 0) {
-             throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar a empresa (além do company_id).");
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Nenhum dado fornecido para atualizar a empresa (além do company_id)."
+          );
         }
-        const response = await axiosInstance.put(`/companies/${company_id}`, updateData, { headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+
+        const response = await axiosInstance.put(`/companies/${company_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
 
-       // Caso para Gerenciamento de Notas (POST)
-       case "create_note": {
-        const noteArgs = toolArgs;
-        if (!isValidCreateNoteArgs(noteArgs)) {
-           throw new McpError(ErrorCode.InvalidParams, "Argumentos inválidos para create_note. 'content' (string) e pelo menos um ID ('deal_id', 'person_id', ou 'company_id') são obrigatórios.");
+      case "create_note": {
+        if (!isValidCreateNoteArgs(toolArgs)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Argumentos inválidos para create_note. 'content' (string) e pelo menos um ID ('deal_id', 'person_id', ou 'company_id') são obrigatórios."
+          );
         }
-        const response = await axiosInstance.post('/notes', noteArgs, { headers: requestHeaders }); // Adicionar headers
-        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        const response = await axiosInstance.post("/notes", toolArgs, {
+          headers: requestHeaders,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
       }
-
 
       default:
-        // Ferramenta desconhecida
-        throw new McpError(ErrorCode.MethodNotFound, `Ferramenta desconhecida: ${name}`);
+        throw new McpError(
+          ErrorCode.MethodNotFound,
+          `Ferramenta desconhecida: ${name}`
+        );
     }
   } catch (error) {
-    // Usar a variável 'name' declarada fora do try
-    const toolName = name || request?.params?.name || 'desconhecida'; // Fallback se 'name' não foi atribuído
+    const toolName = name || request?.params?.name || "desconhecida";
     console.error(`Erro ao executar a ferramenta ${toolName}:`, error);
 
-    // Tratar erros específicos do Axios (API PipeRun)
     if (axios.isAxiosError(error)) {
       const axiosError = error as AxiosError;
       const status = axiosError.response?.status;
       const data = axiosError.response?.data;
-      const message = `Erro na API PipeRun (${status}): ${JSON.stringify(data) || axiosError.message}`;
+      const message = `Erro na API PipeRun (${status}): ${
+        (data ? JSON.stringify(data) : "") || axiosError.message
+      }`;
 
-      // Mapear para erros MCP apropriados
       let errorCode = ErrorCode.InternalError;
-      if (status === 401 || status === 403) {
-          errorCode = ErrorCode.InvalidRequest; // Token inválido ou sem permissão
-      } else if (status === 400 || status === 422) {
-          errorCode = ErrorCode.InvalidParams; // Erro de validação da API
-      } else if (status === 404) {
-          errorCode = ErrorCode.InvalidRequest; // Recurso não encontrado
-      }
+      if (status === 401 || status === 403) errorCode = ErrorCode.InvalidRequest;
+      else if (status === 400 || status === 422) errorCode = ErrorCode.InvalidParams;
+      else if (status === 404) errorCode = ErrorCode.InvalidRequest;
 
       throw new McpError(errorCode, message);
     }
 
-    // Tratar outros erros
     if (error instanceof McpError) {
-        throw error; // Re-lançar erros MCP já tratados
+      throw error;
     }
 
-    // Erro genérico
-    throw new McpError(ErrorCode.InternalError, `Erro interno do servidor: ${error instanceof Error ? error.message : String(error)}`);
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Erro interno do servidor: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 });
 
@@ -481,7 +508,7 @@ server.onerror = (error: unknown) => {
   console.error("[MCP Server Error]", error);
 };
 
-process.on('SIGINT', async () => {
+process.on("SIGINT", async () => {
   console.log("Recebido SIGINT. Encerrando servidor MCP...");
   await server.close();
   process.exit(0);
@@ -489,10 +516,9 @@ process.on('SIGINT', async () => {
 
 // 7. Função principal para iniciar o servidor
 async function main() {
-  // Remover verificação de token daqui, pois será feito por chamada
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Servidor MCP PipeRun rodando via stdio..."); // Log para stderr
+  console.error("Servidor MCP PipeRun rodando via stdio...");
 }
 
 main().catch((error) => {
