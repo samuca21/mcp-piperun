@@ -9,7 +9,19 @@ import {
   ErrorCode,
   CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+
 import axios, { AxiosError } from "axios";
+
+// IMPORTANTE (MCP stdio): qualquer saída em stdout quebra o protocolo.
+// Forçamos logs para stderr para evitar que dependências usem stdout.
+// (As respostas das tools continuam indo pelo protocolo MCP, não via console.)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(console as any).log = (...args: any[]) => console.error(...args);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(console as any).info = (...args: any[]) => console.error(...args);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(console as any).warn = (...args: any[]) => console.error(...args);
+
 
 // 2. Configurar instância do Axios (sem token global)
 const PIPERUN_API_BASE_URL = "https://api.pipe.run/v1";
@@ -19,6 +31,114 @@ const axiosInstance = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+// ActivityType IDs (conta do cliente). Defaults apenas para tipo de atividade.
+// Pipeline/Stage NÃO possuem defaults.
+const ACTIVITY_TYPE_MEETING_ID_DEFAULT = 243787;
+const ACTIVITY_TYPE_CALL_ID_DEFAULT = 243785;
+
+function normalizeEmail(v?: string): string {
+  return (v || "").trim().toLowerCase();
+}
+
+function normalizePhone(v?: string): string {
+  return (v || "")
+    .toString()
+    .trim()
+    .replace(/[^0-9+]/g, "")
+    .replace(/^00/, "+");
+}
+
+async function listAllPages<T>(opts: {
+  endpoint: string;
+  params: Record<string, any>;
+  headers: Record<string, any>;
+  maxPages?: number;
+  show?: number;
+}): Promise<T[]> {
+  const out: T[] = [];
+  const maxPages = Math.max(1, Math.min(20, opts.maxPages ?? 5));
+  const show = Math.max(1, Math.min(200, opts.show ?? 200));
+
+  for (let page = 1; page <= maxPages; page++) {
+    const resp = await axiosInstance.get(opts.endpoint, {
+      params: { ...opts.params, page, show },
+      headers: opts.headers,
+    });
+
+    const data = (resp.data as any)?.data;
+    if (Array.isArray(data)) {
+      out.push(...(data as T[]));
+      if (data.length < show) break;
+    } else if (Array.isArray(resp.data)) {
+      out.push(...(resp.data as T[]));
+      if ((resp.data as any[]).length < show) break;
+    } else {
+      break;
+    }
+  }
+
+  return out;
+}
+
+function findPersonMatch(person: any, email?: string, phone?: string): boolean {
+  const e = normalizeEmail(email);
+  const p = normalizePhone(phone);
+
+  const emailCandidates: string[] = [];
+  if (typeof person?.email === "string") emailCandidates.push(person.email);
+  if (Array.isArray(person?.emails)) {
+    for (const it of person.emails) {
+      if (typeof it === "string") emailCandidates.push(it);
+      else if (typeof it?.value === "string") emailCandidates.push(it.value);
+      else if (typeof it?.email === "string") emailCandidates.push(it.email);
+    }
+  }
+
+  const phoneCandidates: string[] = [];
+  if (typeof person?.phone === "string") phoneCandidates.push(person.phone);
+  if (Array.isArray(person?.phones)) {
+    for (const it of person.phones) {
+      if (typeof it === "string") phoneCandidates.push(it);
+      else if (typeof it?.value === "string") phoneCandidates.push(it.value);
+      else if (typeof it?.phone === "string") phoneCandidates.push(it.phone);
+    }
+  }
+
+  const hasEmailMatch = !!e && emailCandidates.map(normalizeEmail).includes(e);
+  const hasPhoneMatch = !!p && phoneCandidates.map(normalizePhone).includes(p);
+
+  return hasEmailMatch || hasPhoneMatch;
+}
+
+function findCompanyMatch(company: any, domain?: string, name?: string): boolean {
+  const d = (domain || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/$/, "");
+  const n = (name || "").trim().toLowerCase();
+
+  const companyName = (company?.name || "").toString().trim().toLowerCase();
+  const website = (company?.website || company?.site || "").toString().trim().toLowerCase();
+  const websiteNorm = website
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/$/, "");
+
+  const byDomain = !!d && (websiteNorm === d || websiteNorm.endsWith("." + d));
+  const byName = !!n && companyName === n;
+
+  return byDomain || byName;
+}
+
+function stableHash(str: string): number {
+  // djb2
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = (h * 33) ^ str.charCodeAt(i);
+  return Math.abs(h >>> 0);
+}
 
 // Interface para validação dos argumentos de create_person
 interface CreatePersonArgs {
@@ -168,6 +288,192 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: [] as string[],
         },
       },
+      // Aliases para oportunidades (vendas)
+      {
+        name: "list_opportunities",
+        description: "Alias de list_deals (linguagem de vendas). Recupera uma lista de oportunidades do PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            pipeline_id: { type: "number", description: "(Opcional) ID do funil para filtrar oportunidades." },
+            person_id: { type: "number", description: "(Opcional) ID da pessoa para filtrar oportunidades" },
+            page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
+            show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" },
+          },
+          required: [] as string[],
+        },
+      },
+      {
+        name: "get_opportunity",
+        description: "Alias de get_deal (linguagem de vendas). Recupera os detalhes de uma oportunidade (deal) específica.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+          },
+          required: ["deal_id"],
+        },
+      },
+      {
+        name: "create_opportunity",
+        description: "Alias de create_deal (linguagem de vendas). Cria uma nova oportunidade no PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            title: { type: "string", description: "Título da oportunidade" },
+            pipeline_id: { type: "integer", description: "(Obrigatório) ID do funil." },
+            stage_id: { type: "integer", description: "(Obrigatório) ID da etapa." },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            value: { type: "number", description: "(Opcional) Valor da oportunidade" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+            deal_source_id: { type: "integer", description: "(Opcional) ID da origem do negócio" },
+            loss_reason_id: { type: "integer", description: "(Opcional) ID do motivo de perda" },
+          },
+          required: ["title", "pipeline_id", "stage_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "update_opportunity",
+        description: "Alias de update_deal (linguagem de vendas). Atualiza uma oportunidade existente.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+            title: { type: "string", description: "(Opcional) Título" },
+            pipeline_id: { type: "integer", description: "(Opcional) ID do funil" },
+            stage_id: { type: "integer", description: "(Opcional) ID da etapa" },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            value: { type: "number", description: "(Opcional) Valor" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+          },
+          required: ["deal_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "delete_opportunity",
+        description: "Alias de delete_deal (linguagem de vendas). Remove uma oportunidade (deal) pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+          },
+          required: ["deal_id"],
+        },
+      },
+
+      {
+        name: "get_deal",
+        description: "Recupera os detalhes de uma oportunidade (deal) específica.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+          },
+          required: ["deal_id"],
+        },
+      },
+      {
+        name: "create_deal",
+        description: "Cria uma nova oportunidade (deal) no PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            title: { type: "string", description: "Título da oportunidade" },
+            pipeline_id: { type: "integer", description: "(Obrigatório) ID do funil." },
+            stage_id: { type: "integer", description: "(Obrigatório) ID da etapa." },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            value: { type: "number", description: "(Opcional) Valor da oportunidade" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+            deal_source_id: { type: "integer", description: "(Opcional) ID da origem do negócio" },
+            loss_reason_id: { type: "integer", description: "(Opcional) ID do motivo de perda" },
+          },
+          required: ["title", "pipeline_id", "stage_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "update_deal",
+        description: "Atualiza uma oportunidade (deal) existente no PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+            title: { type: "string", description: "(Opcional) Título" },
+            pipeline_id: { type: "integer", description: "(Opcional) ID do funil" },
+            stage_id: { type: "integer", description: "(Opcional) ID da etapa" },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            value: { type: "number", description: "(Opcional) Valor" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+          },
+          required: ["deal_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "delete_deal",
+        description: "Remove uma oportunidade (deal) pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+          },
+          required: ["deal_id"],
+        },
+      },
+
+      {
+        name: "piperun_request",
+        description:
+          "Chama qualquer endpoint da API do PipeRun (uso avançado). Ex: GET /me, GET /deals, POST /activities, etc.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: {
+              type: "string",
+              description:
+                "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente.",
+            },
+            method: {
+              type: "string",
+              description: "HTTP method: GET | POST | PUT | DELETE",
+              enum: ["GET", "POST", "PUT", "DELETE"],
+            },
+            path: {
+              type: "string",
+              description:
+                "Caminho a partir do /v1. Ex: /me, /deals, /activities, /calls, /customFields",
+            },
+            query: {
+              type: "object",
+              description: "(Opcional) Querystring como objeto",
+              additionalProperties: true,
+            },
+            body: {
+              type: "object",
+              description: "(Opcional) Body JSON para POST/PUT",
+              additionalProperties: true,
+            },
+          },
+          required: ["method", "path"],
+          additionalProperties: false,
+        },
+      },
+
       {
         name: "create_person",
         description: "Cria uma nova pessoa (lead/contato) no PipeRun CRM.",
@@ -182,6 +488,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             company_id: { type: "integer", description: "(Opcional) ID da empresa associada" },
           },
           required: ["name", "owner_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "list_persons",
+        description: "Recupera uma lista de pessoas (leads/contatos) do PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            page: { type: "number", description: "(Opcional) Número da página (padrão: 1)" },
+            show: { type: "number", description: "(Opcional) Quantidade por página (padrão: 20, máx: 200)" },
+            with: { type: "string", description: "(Opcional) Entidades relacionadas a incluir (ex: 'company,owner')" },
+          },
+          required: [] as string[],
+        },
+      },
+      {
+        name: "get_person",
+        description: "Recupera os detalhes de uma pessoa (lead/contato) pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            person_id: { type: "integer", description: "ID da pessoa" },
+          },
+          required: ["person_id"],
+        },
+      },
+      {
+        name: "update_person",
+        description: "Atualiza uma pessoa existente (lead/contato).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            person_id: { type: "integer", description: "ID da pessoa" },
+          },
+          required: ["person_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "delete_person",
+        description: "Remove uma pessoa (lead/contato) pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            person_id: { type: "integer", description: "ID da pessoa" },
+          },
+          required: ["person_id"],
         },
       },
 
@@ -202,6 +560,123 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       { name: "list_items", description: "Recupera uma lista de produtos do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
       { name: "list_users", description: "Recupera uma lista de usuários (vendedores) do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
       { name: "list_activities", description: "Recupera uma lista de atividades do PipeRun CRM.", inputSchema: listActivitiesInputSchema },
+      { name: "list_calls", description: "Recupera uma lista de histórico de ligações do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
+      {
+        name: "get_activity",
+        description: "Recupera os detalhes de uma atividade específica.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            activity_id: { type: "integer", description: "ID da atividade" },
+          },
+          required: ["activity_id"],
+        },
+      },
+      {
+        name: "create_activity",
+        description: "Cria uma nova atividade (tarefa/reunião) no PipeRun CRM.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            title: { type: "string", description: "Título da atividade" },
+            activity_type_id: { type: "integer", description: "ID do tipo de atividade (obrigatório)" },
+            status: { type: "integer", description: "Status (obrigatório). Ex: 0=Aberta, 2=Concluída, 4=No Show" },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            deal_id: { type: "integer", description: "(Opcional) ID da oportunidade" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+            start_at: { type: "string", description: "(Opcional) Início (date-time)" },
+            end_at: { type: "string", description: "(Opcional) Fim (date-time)" },
+            description: { type: "string", description: "(Opcional) Descrição" },
+          },
+          required: ["title", "activity_type_id", "status"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "update_activity",
+        description: "Atualiza uma atividade existente.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            activity_id: { type: "integer", description: "ID da atividade" },
+            title: { type: "string", description: "(Opcional) Título" },
+            activity_type_id: { type: "integer", description: "(Opcional) Tipo" },
+            status: { type: "integer", description: "(Opcional) Status" },
+            owner_id: { type: "integer", description: "(Opcional) Responsável" },
+            start_at: { type: "string", description: "(Opcional) Início (date-time)" },
+            end_at: { type: "string", description: "(Opcional) Fim (date-time)" },
+            description: { type: "string", description: "(Opcional) Descrição" },
+          },
+          required: ["activity_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "delete_activity",
+        description: "Remove uma atividade pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            activity_id: { type: "integer", description: "ID da atividade" },
+          },
+          required: ["activity_id"],
+        },
+      },
+
+            {
+        name: "get_call",
+        description: "Recupera os detalhes de um registro de ligação.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            call_id: { type: "integer", description: "ID do registro de ligação" },
+          },
+          required: ["call_id"],
+        },
+      },
+      {
+        name: "create_call",
+        description: "Cria um registro de histórico de ligação no PipeRun.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." }
+          },
+          required: [],
+          additionalProperties: true
+        },
+      },
+      {
+        name: "update_call",
+        description: "Atualiza um registro de histórico de ligação.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            call_id: { type: "integer", description: "ID do registro de ligação" }
+          },
+          required: ["call_id"],
+          additionalProperties: true
+        },
+      },
+      {
+        name: "delete_call",
+        description: "Remove um registro de histórico de ligação.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            call_id: { type: "integer", description: "ID do registro de ligação" }
+          },
+          required: ["call_id"]
+        },
+      },
 
       // Empresas
       { name: "list_companies", description: "Recupera uma lista de empresas do PipeRun CRM.", inputSchema: listToolPaginatedInputSchema },
@@ -296,6 +771,357 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             company_id: { type: "number", description: "(Opcional) ID da empresa para associar a nota" },
           },
           required: ["content"],
+          anyOf: [
+            { required: ["deal_id"] },
+            { required: ["person_id"] },
+            { required: ["company_id"] },
+          ],
+        },
+      },
+      {
+        name: "get_note",
+        description: "Recupera os detalhes de uma nota pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            note_id: { type: "integer", description: "ID da nota" },
+          },
+          required: ["note_id"],
+        },
+      },
+      {
+        name: "update_note",
+        description: "Atualiza uma nota existente.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            note_id: { type: "integer", description: "ID da nota" },
+            content: { type: "string", description: "(Opcional) Conteúdo da nota" },
+            deal_id: { type: "number", description: "(Opcional) ID da oportunidade" },
+            person_id: { type: "number", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "number", description: "(Opcional) ID da empresa" },
+          },
+          required: ["note_id"],
+          additionalProperties: true,
+        },
+      },
+      {
+        name: "delete_note",
+        description: "Remove uma nota pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            note_id: { type: "integer", description: "ID da nota" },
+          },
+          required: ["note_id"],
+        },
+      },
+      // ===== RevOps flow tools =====
+      {
+        name: "upsert_person_by_email_or_phone",
+        description: "Busca pessoa por email/telefone. Se não encontrar, cria (requer owner_id para criar).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            name: { type: "string", description: "Nome (usado para criar se não existir)" },
+            owner_id: { type: "integer", description: "(Obrigatório para criar) ID do responsável" },
+            email: { type: "string", description: "(Opcional) Email" },
+            phone: { type: "string", description: "(Opcional) Telefone" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+            max_pages: { type: "integer", description: "(Opcional) Máx páginas para busca (padrão 5, máx 20)" },
+            show: { type: "integer", description: "(Opcional) Itens por página (padrão 200, máx 200)" }
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "upsert_company_by_domain_or_name",
+        description: "Busca empresa por domínio/site ou nome. Se não encontrar, cria (requer owner_id para criar).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            name: { type: "string", description: "Nome (usado para criar se não existir)" },
+            domain: { type: "string", description: "(Opcional) Domínio/site (ex: empresa.com)" },
+            owner_id: { type: "integer", description: "(Obrigatório para criar) ID do responsável" },
+            email: { type: "string", description: "(Opcional) Email" },
+            phone: { type: "string", description: "(Opcional) Telefone" },
+            max_pages: { type: "integer", description: "(Opcional) Máx páginas para busca (padrão 5, máx 20)" },
+            show: { type: "integer", description: "(Opcional) Itens por página (padrão 200, máx 200)" }
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "route_lead_to_owner",
+        description: "Escolhe determinísticamente um owner_id a partir de uma chave (email/telefone/domínio) e uma lista de candidatos.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            key: { type: "string", description: "Chave de roteamento (ex: email/domínio)" },
+            candidates_owner_ids: {
+              type: "array",
+              items: { type: "integer" },
+              description: "Lista de IDs de vendedores elegíveis"
+            }
+          },
+          required: ["key", "candidates_owner_ids"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "assign_deal_owner",
+        description: "Define/atualiza o owner_id de uma oportunidade (deal).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+            owner_id: { type: "integer", description: "ID do responsável" }
+          },
+          required: ["deal_id", "owner_id"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "create_meeting_activity_for_deal",
+        description: "Cria uma atividade do tipo Reunião vinculada a uma oportunidade (deal).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            deal_id: { type: "integer", description: "ID da oportunidade" },
+            title: { type: "string", description: "Título da reunião" },
+            owner_id: { type: "integer", description: "(Opcional) ID do responsável" },
+            start_at: { type: "string", format: "date-time", description: "(Opcional) Início (date-time)" },
+            end_at: { type: "string", format: "date-time", description: "(Opcional) Fim (date-time)" },
+            description: { type: "string", description: "(Opcional) Descrição" },
+            status: { type: "integer", description: "(Opcional) Status (default 0=Aberta)" },
+            activity_type_id: { type: "integer", description: "(Opcional) ID do tipo (default: Reunião)" }
+          },
+          required: ["deal_id", "title"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "create_opportunity_bundle",
+        description: "Cria oportunidade (deal) + (opcional) upsert de pessoa/empresa + nota do scraping.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            // deal
+            title: { type: "string", description: "Título da oportunidade" },
+            pipeline_id: { type: "integer", description: "ID do funil" },
+            stage_id: { type: "integer", description: "ID da etapa" },
+            value: { type: "number", description: "(Opcional) Valor" },
+            owner_id: { type: "integer", description: "(Opcional) Owner do deal" },
+            // person
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa (se já existir)" },
+            person_name: { type: "string", description: "(Opcional) Nome da pessoa (para upsert/criar)" },
+            person_owner_id: { type: "integer", description: "(Opcional) Owner da pessoa (necessário se for criar)" },
+            person_email: { type: "string", description: "(Opcional) Email da pessoa" },
+            person_phone: { type: "string", description: "(Opcional) Telefone da pessoa" },
+            // company
+            company_id: { type: "integer", description: "(Opcional) ID da empresa (se já existir)" },
+            company_name: { type: "string", description: "(Opcional) Nome da empresa (para upsert/criar)" },
+            company_owner_id: { type: "integer", description: "(Opcional) Owner da empresa (necessário se for criar)" },
+            company_domain: { type: "string", description: "(Opcional) Domínio/site" },
+            company_email: { type: "string", description: "(Opcional) Email da empresa" },
+            company_phone: { type: "string", description: "(Opcional) Telefone da empresa" },
+            // note
+            note_content: { type: "string", description: "(Opcional) Nota (ex: resumo do scraping)" },
+            // search controls
+            max_pages: { type: "integer", description: "(Opcional) Máx páginas para busca (padrão 5, máx 20)" },
+            show: { type: "integer", description: "(Opcional) Itens por página (padrão 200, máx 200)" }
+          },
+          required: ["title", "pipeline_id", "stage_id"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "log_outbound_call_and_outcome",
+        description: "Registra histórico de ligação (calls) e cria nota. Opcionalmente cria follow-up activity.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            call_body: { type: "object", description: "(Opcional) Body para POST /calls", additionalProperties: true },
+            note_content: { type: "string", description: "(Obrigatório) Conteúdo da nota (resultado da ligação)" },
+            deal_id: { type: "integer", description: "(Opcional) ID do deal" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" },
+            followup: {
+              type: "object",
+              description: "(Opcional) Se presente, cria uma activity de follow-up",
+              properties: {
+                title: { type: "string" },
+                owner_id: { type: "integer" },
+                start_at: { type: "string", format: "date-time" },
+                end_at: { type: "string", format: "date-time" },
+                description: { type: "string" },
+                status: { type: "integer" },
+                activity_type_id: { type: "integer", description: "(Opcional) default: Ligação" }
+              },
+              required: ["title"],
+              additionalProperties: false
+            }
+          },
+          required: ["note_content"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "complete_activity_with_notes",
+        description: "Conclui uma activity (status=2) e opcionalmente cria uma nota vinculada.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente." },
+            activity_id: { type: "integer", description: "ID da atividade" },
+            note_content: { type: "string", description: "(Opcional) Conteúdo da nota" },
+            deal_id: { type: "integer", description: "(Opcional) ID do deal" },
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa" },
+            company_id: { type: "integer", description: "(Opcional) ID da empresa" }
+          },
+          required: ["activity_id"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "revops_intake",
+        description:
+          "Super-tool de intake RevOps: usa dados de scraping/ligação para (1) upsert pessoa/empresa, (2) criar oportunidade, (3) registrar nota/outcome e (4) opcionalmente criar reunião e atribuir vendedor.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: {
+              type: "string",
+              description:
+                "(Opcional) Token da API do PipeRun. Se omitido, usa PIPERUN_API_TOKEN do ambiente.",
+            },
+
+            // routing / ownership
+            candidates_owner_ids: {
+              type: "array",
+              items: { type: "integer" },
+              description:
+                "(Opcional) Lista de owners elegíveis. Se informado e owner não vier explícito, o tool escolhe determinísticamente (hash) a partir de uma chave (email/telefone/domínio).",
+            },
+            routing_key: {
+              type: "string",
+              description:
+                "(Opcional) Chave de roteamento. Se omitida, usa person_email || person_phone || company_domain || company_name.",
+            },
+
+            // deal (obrigatório)
+            title: { type: "string", description: "Título da oportunidade" },
+            pipeline_id: { type: "integer", description: "(Obrigatório) ID do funil" },
+            stage_id: { type: "integer", description: "(Obrigatório) ID da etapa" },
+            value: { type: "number", description: "(Opcional) Valor" },
+            deal_owner_id: {
+              type: "integer",
+              description:
+                "(Opcional) Owner do deal. Se omitido e candidates_owner_ids for informado, será escolhido automaticamente.",
+            },
+
+            // person
+            person_id: { type: "integer", description: "(Opcional) ID da pessoa (se já existir)" },
+            person_name: {
+              type: "string",
+              description:
+                "(Opcional) Nome da pessoa (para upsert/criar). Se pessoa não existir, este campo é obrigatório para criar.",
+            },
+            person_email: { type: "string", description: "(Opcional) Email" },
+            person_phone: { type: "string", description: "(Opcional) Telefone" },
+            person_owner_id: {
+              type: "integer",
+              description:
+                "(Opcional) Owner da pessoa. Se omitido e candidates_owner_ids for informado, será escolhido automaticamente para criação.",
+            },
+
+            // company
+            company_id: { type: "integer", description: "(Opcional) ID da empresa (se já existir)" },
+            company_name: {
+              type: "string",
+              description:
+                "(Opcional) Nome da empresa (para upsert/criar). Se empresa não existir, este campo é obrigatório para criar.",
+            },
+            company_domain: { type: "string", description: "(Opcional) Domínio/site (ex: empresa.com)" },
+            company_email: { type: "string", description: "(Opcional) Email" },
+            company_phone: { type: "string", description: "(Opcional) Telefone" },
+            company_owner_id: {
+              type: "integer",
+              description:
+                "(Opcional) Owner da empresa. Se omitido e candidates_owner_ids for informado, será escolhido automaticamente para criação.",
+            },
+
+            // context / notes
+            note_content: {
+              type: "string",
+              description:
+                "(Opcional) Nota consolidada (ex: resumo do scraping, motivo do contato, etc).",
+            },
+            call_outcome: {
+              type: "string",
+              description:
+                "(Opcional) Outcome da ligação (ex: 'agendou', 'não atendeu', 'follow-up', etc).",
+            },
+            call_body: {
+              type: "object",
+              description: "(Opcional) Body bruto para POST /calls",
+              additionalProperties: true,
+            },
+
+            // meeting
+            meeting: {
+              type: "object",
+              description:
+                "(Opcional) Se presente, cria uma activity do tipo Reunião vinculada ao deal criado.",
+              properties: {
+                title: { type: "string" },
+                owner_id: { type: "integer" },
+                start_at: { type: "string", format: "date-time" },
+                end_at: { type: "string", format: "date-time" },
+                description: { type: "string" },
+                status: { type: "integer" },
+                activity_type_id: { type: "integer" },
+              },
+              required: ["title"],
+              additionalProperties: false,
+            },
+
+            // follow-up activity
+            followup: {
+              type: "object",
+              description:
+                "(Opcional) Se presente, cria uma activity de follow-up (default: Ligação) vinculada ao deal.",
+              properties: {
+                title: { type: "string" },
+                owner_id: { type: "integer" },
+                start_at: { type: "string", format: "date-time" },
+                end_at: { type: "string", format: "date-time" },
+                description: { type: "string" },
+                status: { type: "integer" },
+                activity_type_id: { type: "integer" },
+              },
+              required: ["title"],
+              additionalProperties: false,
+            },
+
+            // search controls
+            max_pages: { type: "integer", description: "(Opcional) Máx páginas para busca (padrão 5, máx 20)" },
+            show: { type: "integer", description: "(Opcional) Itens por página (padrão 200, máx 200)" },
+          },
+          required: ["title", "pipeline_id", "stage_id"],
+          additionalProperties: false,
         },
       },
     ],
@@ -316,13 +1142,322 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       args && typeof args === "object" ? { ...(args as any) } : {};
     delete toolArgs.api_token;
 
+    // Normaliza campos numéricos que podem vir como string (ex: "94766")
+    for (const [key, value] of Object.entries(toolArgs)) {
+      if (key.endsWith("_id") || key === "page" || key === "show" || key === "status") {
+        if (
+          typeof value === "string" &&
+          value.trim() !== "" &&
+          !Number.isNaN(Number(value))
+        ) {
+          toolArgs[key] = Number(value);
+        }
+      }
+    }
+
+
     const requestHeaders = {
       token: api_token,
       "Content-Type": "application/json",
     };
 
     switch (name) {
-      case "list_deals": {
+      case "piperun_request": {
+        if (!toolArgs || typeof toolArgs !== "object") {
+          throw new McpError(ErrorCode.InvalidParams, "Argumentos inválidos.");
+        }
+
+        const methodRaw = toolArgs.method;
+        const pathRaw = toolArgs.path;
+        const query = toolArgs.query;
+        const body = toolArgs.body;
+
+        if (!methodRaw || !pathRaw) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "piperun_request exige 'method' e 'path'."
+          );
+        }
+
+        const method = String(methodRaw).toUpperCase();
+        if (!["GET", "POST", "PUT", "DELETE"].includes(method)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "method inválido. Use GET | POST | PUT | DELETE."
+          );
+        }
+
+        // Segurança: impedir URL absoluta (axios ignora baseURL se receber URL absoluta)
+        const pathStr = String(pathRaw).trim();
+        if (pathStr.startsWith("//") || pathStr.includes("://")) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "path inválido. Use apenas caminhos relativos a /v1 (ex: /deals, /me)."
+          );
+        }
+
+        // Normaliza path: garante '/' e remove prefixo '/v1' se o usuário passar
+        let normalizedPath = pathStr.startsWith("/") ? pathStr : `/${pathStr}`;
+        if (normalizedPath.startsWith("/v1/")) normalizedPath = normalizedPath.slice(3);
+        if (normalizedPath === "/v1") normalizedPath = "/";
+
+        const response = await axiosInstance.request({
+          method,
+          url: normalizedPath, // axiosInstance já tem baseURL /v1
+          params: query,
+          data: body,
+          headers: requestHeaders,
+        });
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
+      }
+
+      case "get_deal":
+      case "get_opportunity": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/deals/${toolArgs.deal_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "create_deal":
+      case "create_opportunity": {
+        if (typeof toolArgs.title !== "string" || !toolArgs.title.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'title' (string) é obrigatório.");
+        }
+        if (typeof toolArgs.pipeline_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "O campo 'pipeline_id' (number) é obrigatório."
+          );
+        }
+        if (typeof toolArgs.stage_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "O campo 'stage_id' (number) é obrigatório."
+          );
+        }
+
+        const response = await axiosInstance.post("/deals", toolArgs, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_deal":
+      case "update_opportunity": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        const deal_id = toolArgs.deal_id;
+        const updateData = { ...toolArgs };
+        delete updateData.deal_id;
+
+        if (Object.keys(updateData).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do deal_id).");
+        }
+
+        const response = await axiosInstance.put(`/deals/${deal_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_deal":
+      case "delete_opportunity": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/deals/${toolArgs.deal_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      // People/Notes CRUD handlers
+      case "get_person": {
+        if (typeof toolArgs.person_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'person_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/persons/${toolArgs.person_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_person": {
+        if (typeof toolArgs.person_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'person_id' (number) é obrigatório.");
+        }
+        const person_id = toolArgs.person_id;
+        const updateData = { ...toolArgs };
+        delete updateData.person_id;
+
+        if (Object.keys(updateData).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do person_id)." );
+        }
+
+        const response = await axiosInstance.put(`/persons/${person_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_person": {
+        if (typeof toolArgs.person_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'person_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/persons/${toolArgs.person_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "get_note": {
+        if (typeof toolArgs.note_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'note_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/notes/${toolArgs.note_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_note": {
+        if (typeof toolArgs.note_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'note_id' (number) é obrigatório.");
+        }
+        const note_id = toolArgs.note_id;
+        const updateData = { ...toolArgs };
+        delete updateData.note_id;
+
+        if (Object.keys(updateData).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do note_id)." );
+        }
+
+        const response = await axiosInstance.put(`/notes/${note_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_note": {
+        if (typeof toolArgs.note_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'note_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/notes/${toolArgs.note_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "get_activity": {
+        if (typeof toolArgs.activity_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'activity_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/activities/${toolArgs.activity_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "create_activity": {
+        if (typeof toolArgs.title !== "string" || !toolArgs.title.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'title' (string) é obrigatório.");
+        }
+        if (typeof toolArgs.activity_type_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'activity_type_id' (number) é obrigatório.");
+        }
+        if (typeof toolArgs.status !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'status' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.post("/activities", toolArgs, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_activity": {
+        if (typeof toolArgs.activity_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'activity_id' (number) é obrigatório.");
+        }
+        const activity_id = toolArgs.activity_id;
+        const updateData = { ...toolArgs };
+        delete updateData.activity_id;
+
+        if (Object.keys(updateData).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do activity_id).");
+        }
+
+        const response = await axiosInstance.put(`/activities/${activity_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_activity": {
+        if (typeof toolArgs.activity_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'activity_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/activities/${toolArgs.activity_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "get_call": {
+        if (typeof toolArgs.call_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'call_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/calls/${toolArgs.call_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "create_call": {
+        const response = await axiosInstance.post("/calls", toolArgs, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_call": {
+        if (typeof toolArgs.call_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'call_id' (number) é obrigatório.");
+        }
+        const call_id = toolArgs.call_id;
+        const updateData = { ...toolArgs };
+        delete updateData.call_id;
+
+        if (Object.keys(updateData).length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do call_id).");
+        }
+
+        const response = await axiosInstance.put(`/calls/${call_id}`, updateData, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_call": {
+        if (typeof toolArgs.call_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'call_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/calls/${toolArgs.call_id}`, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+
+      case "list_deals":
+      case "list_opportunities": {
         const response = await axiosInstance.get("/deals", {
           params: toolArgs,
           headers: requestHeaders,
@@ -356,6 +1491,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
       // Listagens genéricas
       case "list_pipelines":
+      case "list_calls":
       case "list_stages":
       case "list_items":
       case "list_users":
@@ -366,10 +1502,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case "list_deal_sources":
       case "list_activity_types":
       case "list_custom_fields":
-      case "list_notes": {
+      case "list_notes":
+      case "list_persons": {
         let endpoint = "";
         switch (name) {
           case "list_pipelines": endpoint = "/pipelines"; break;
+          case "list_calls": endpoint = "/calls"; break;
           case "list_stages": endpoint = "/stages"; break;
           case "list_items": endpoint = "/items"; break;
           case "list_users": endpoint = "/users"; break;
@@ -378,9 +1516,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           case "list_tags": endpoint = "/tags"; break;
           case "list_loss_reasons": endpoint = "/loss-reasons"; break;
           case "list_deal_sources": endpoint = "/deal-sources"; break;
-          case "list_activity_types": endpoint = "/activity-types"; break;
-          case "list_custom_fields": endpoint = "/custom-fields"; break;
+          case "list_activity_types": endpoint = "/activityTypes"; break;
+          case "list_custom_fields": endpoint = "/customFields"; break;
           case "list_notes": endpoint = "/notes"; break;
+          case "list_persons": endpoint = "/persons"; break;
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -466,6 +1605,243 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         };
       }
 
+      case "revops_intake": {
+        // Deal obrigatório
+        if (typeof toolArgs.title !== "string" || !toolArgs.title.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "'title' (string) é obrigatório.");
+        }
+        if (typeof toolArgs.pipeline_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "'pipeline_id' (number) é obrigatório.");
+        }
+        if (typeof toolArgs.stage_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "'stage_id' (number) é obrigatório.");
+        }
+
+        const maxPages = typeof toolArgs.max_pages === "number" ? toolArgs.max_pages : 5;
+        const show = typeof toolArgs.show === "number" ? toolArgs.show : 200;
+
+        // Resolve routing key
+        const routingKey =
+          (typeof toolArgs.routing_key === "string" && toolArgs.routing_key.trim())
+            ? toolArgs.routing_key.trim()
+            : (
+                (typeof toolArgs.person_email === "string" && toolArgs.person_email.trim())
+                  ? toolArgs.person_email.trim()
+                  : (
+                      (typeof toolArgs.person_phone === "string" && toolArgs.person_phone.trim())
+                        ? toolArgs.person_phone.trim()
+                        : (
+                            (typeof toolArgs.company_domain === "string" && toolArgs.company_domain.trim())
+                              ? toolArgs.company_domain.trim()
+                              : (
+                                  (typeof toolArgs.company_name === "string" && toolArgs.company_name.trim())
+                                    ? toolArgs.company_name.trim()
+                                    : toolArgs.title.trim()
+                                )
+                          )
+                    )
+              );
+
+        const candidates = Array.isArray(toolArgs.candidates_owner_ids)
+          ? (toolArgs.candidates_owner_ids as any[]).filter((x) => typeof x === "number")
+          : [];
+
+        const autoOwner = candidates.length > 0 ? candidates[stableHash(routingKey) % candidates.length] : undefined;
+
+        // Resolve owners (sem defaults de pipeline/stage; apenas escolhe owner quando possível)
+        const dealOwnerId = typeof toolArgs.deal_owner_id === "number" ? toolArgs.deal_owner_id : autoOwner;
+        const personOwnerId = typeof toolArgs.person_owner_id === "number" ? toolArgs.person_owner_id : autoOwner;
+        const companyOwnerId = typeof toolArgs.company_owner_id === "number" ? toolArgs.company_owner_id : autoOwner;
+
+        // 1) Company (upsert)
+        let companyId: number | undefined = typeof toolArgs.company_id === "number" ? toolArgs.company_id : undefined;
+        let companyResult: any = null;
+
+        const companyName = typeof toolArgs.company_name === "string" ? toolArgs.company_name.trim() : "";
+        const companyDomain = typeof toolArgs.company_domain === "string" ? toolArgs.company_domain : undefined;
+
+        if (!companyId && (companyName || companyDomain)) {
+          const companies = await listAllPages<any>({
+            endpoint: "/companies",
+            params: {},
+            headers: requestHeaders,
+            maxPages,
+            show,
+          });
+
+          const foundCompany = companies.find((c) => findCompanyMatch(c, companyDomain, companyName));
+          if (foundCompany && typeof foundCompany?.id === "number") {
+            companyId = foundCompany.id;
+            companyResult = { action: "matched", company: foundCompany };
+          } else {
+            if (!companyName) {
+              throw new McpError(ErrorCode.InvalidParams, "Empresa não encontrada. Para criar, informe 'company_name'.");
+            }
+            if (typeof companyOwnerId !== "number") {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                "Empresa não encontrada. Para criar, informe 'company_owner_id' OU 'candidates_owner_ids' para roteamento."
+              );
+            }
+
+            const payload: any = { name: companyName, owner_id: companyOwnerId };
+            if (typeof toolArgs.company_email === "string" && toolArgs.company_email.trim()) payload.email = toolArgs.company_email;
+            if (typeof toolArgs.company_phone === "string" && toolArgs.company_phone.trim()) payload.phone = toolArgs.company_phone;
+            if (companyDomain) payload.website = companyDomain;
+
+            const createdCompany = await axiosInstance.post("/companies", payload, { headers: requestHeaders });
+            const createdCompanyId = (createdCompany.data as any)?.data?.id ?? (createdCompany.data as any)?.id;
+            if (typeof createdCompanyId === "number") companyId = createdCompanyId;
+            companyResult = { action: "created", company: createdCompany.data };
+          }
+        }
+
+        // 2) Person (upsert)
+        let personId: number | undefined = typeof toolArgs.person_id === "number" ? toolArgs.person_id : undefined;
+        let personResult: any = null;
+
+        const personName = typeof toolArgs.person_name === "string" ? toolArgs.person_name.trim() : "";
+        const personEmail = typeof toolArgs.person_email === "string" ? toolArgs.person_email : undefined;
+        const personPhone = typeof toolArgs.person_phone === "string" ? toolArgs.person_phone : undefined;
+
+        if (!personId && (personName || personEmail || personPhone)) {
+          const persons = await listAllPages<any>({
+            endpoint: "/persons",
+            params: {},
+            headers: requestHeaders,
+            maxPages,
+            show,
+          });
+
+          const foundPerson = persons.find((p) => findPersonMatch(p, personEmail, personPhone));
+          if (foundPerson && typeof foundPerson?.id === "number") {
+            personId = foundPerson.id;
+            personResult = { action: "matched", person: foundPerson };
+          } else {
+            if (!personName) {
+              throw new McpError(ErrorCode.InvalidParams, "Pessoa não encontrada. Para criar, informe 'person_name'.");
+            }
+            if (typeof personOwnerId !== "number") {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                "Pessoa não encontrada. Para criar, informe 'person_owner_id' OU 'candidates_owner_ids' para roteamento."
+              );
+            }
+
+            const payload: any = { name: personName, owner_id: personOwnerId };
+            if (personEmail) payload.email = personEmail;
+            if (personPhone) payload.phone = personPhone;
+            if (companyId) payload.company_id = companyId;
+
+            const createdPerson = await axiosInstance.post("/persons", payload, { headers: requestHeaders });
+            const createdPersonId = (createdPerson.data as any)?.data?.id ?? (createdPerson.data as any)?.id;
+            if (typeof createdPersonId === "number") personId = createdPersonId;
+            personResult = { action: "created", person: createdPerson.data };
+          }
+        }
+
+        // 3) Create deal
+        const dealPayload: any = {
+          title: toolArgs.title.trim(),
+          pipeline_id: toolArgs.pipeline_id,
+          stage_id: toolArgs.stage_id,
+        };
+        if (typeof toolArgs.value === "number") dealPayload.value = toolArgs.value;
+        if (typeof dealOwnerId === "number") dealPayload.owner_id = dealOwnerId;
+        if (personId) dealPayload.person_id = personId;
+        if (companyId) dealPayload.company_id = companyId;
+
+        const createdDeal = await axiosInstance.post("/deals", dealPayload, { headers: requestHeaders });
+        const dealId = (createdDeal.data as any)?.data?.id ?? (createdDeal.data as any)?.id;
+
+        // 4) Optional create call (if call_body provided)
+        let createdCall: any = null;
+        if (toolArgs.call_body && typeof toolArgs.call_body === "object") {
+          createdCall = (await axiosInstance.post("/calls", toolArgs.call_body, { headers: requestHeaders })).data;
+        }
+
+        // 5) Note (scraping + call outcome)
+        let createdNote: any = null;
+        const noteParts: string[] = [];
+        if (typeof toolArgs.note_content === "string" && toolArgs.note_content.trim()) noteParts.push(toolArgs.note_content.trim());
+        if (typeof toolArgs.call_outcome === "string" && toolArgs.call_outcome.trim()) noteParts.push(`Outcome: ${toolArgs.call_outcome.trim()}`);
+
+        const finalNote = noteParts.join("\n\n");
+        if (finalNote && typeof dealId === "number") {
+          createdNote = (await axiosInstance.post(
+            "/notes",
+            { content: finalNote, deal_id: dealId },
+            { headers: requestHeaders }
+          )).data;
+        }
+
+        // 6) Meeting (optional)
+        let createdMeeting: any = null;
+        if (toolArgs.meeting && typeof toolArgs.meeting === "object") {
+          const m = toolArgs.meeting as any;
+          const payload: any = {
+            title: String(m.title || "Reunião").trim(),
+            deal_id: dealId,
+            activity_type_id: typeof m.activity_type_id === "number" ? m.activity_type_id : ACTIVITY_TYPE_MEETING_ID_DEFAULT,
+            status: typeof m.status === "number" ? m.status : 0,
+          };
+          if (typeof m.owner_id === "number") payload.owner_id = m.owner_id;
+          else if (typeof dealOwnerId === "number") payload.owner_id = dealOwnerId;
+          if (typeof m.start_at === "string" && m.start_at.trim()) payload.start_at = m.start_at;
+          if (typeof m.end_at === "string" && m.end_at.trim()) payload.end_at = m.end_at;
+          if (typeof m.description === "string") payload.description = m.description;
+
+          createdMeeting = (await axiosInstance.post("/activities", payload, { headers: requestHeaders })).data;
+        }
+
+        // 7) Follow-up (optional)
+        let createdFollowup: any = null;
+        if (toolArgs.followup && typeof toolArgs.followup === "object") {
+          const f = toolArgs.followup as any;
+          const payload: any = {
+            title: String(f.title || "Follow-up").trim(),
+            deal_id: dealId,
+            activity_type_id: typeof f.activity_type_id === "number" ? f.activity_type_id : ACTIVITY_TYPE_CALL_ID_DEFAULT,
+            status: typeof f.status === "number" ? f.status : 0,
+          };
+          if (typeof f.owner_id === "number") payload.owner_id = f.owner_id;
+          else if (typeof dealOwnerId === "number") payload.owner_id = dealOwnerId;
+          if (typeof f.start_at === "string" && f.start_at.trim()) payload.start_at = f.start_at;
+          if (typeof f.end_at === "string" && f.end_at.trim()) payload.end_at = f.end_at;
+          if (typeof f.description === "string") payload.description = f.description;
+
+          createdFollowup = (await axiosInstance.post("/activities", payload, { headers: requestHeaders })).data;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  routing_key: routingKey,
+                  auto_owner_id: autoOwner,
+                  resolved_owners: {
+                    deal_owner_id: dealOwnerId,
+                    person_owner_id: personOwnerId,
+                    company_owner_id: companyOwnerId,
+                  },
+                  company: companyResult,
+                  person: personResult,
+                  deal: createdDeal.data,
+                  deal_id: dealId,
+                  note: createdNote,
+                  call: createdCall,
+                  meeting: createdMeeting,
+                  followup: createdFollowup,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
       default:
         throw new McpError(
           ErrorCode.MethodNotFound,
@@ -509,7 +1885,7 @@ server.onerror = (error: unknown) => {
 };
 
 process.on("SIGINT", async () => {
-  console.log("Recebido SIGINT. Encerrando servidor MCP...");
+  console.error("Recebido SIGINT. Encerrando servidor MCP...");
   await server.close();
   process.exit(0);
 });

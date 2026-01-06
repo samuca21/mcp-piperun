@@ -11,11 +11,13 @@
     "build"
   ],
   "scripts": {
-    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
+    "build": "tsc --incremental && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "prepare": "npm run build",
-    "watch": "tsc --watch",
-    "inspector": "npx @modelcontextprotocol/inspector build/index.js"
-  },
+    "watch": "tsc -w --preserveWatchOutput",
+    "inspector": "npx @modelcontextprotocol/inspector build/index.js",
+    "inspector:watch": "DANGEROUSLY_OMIT_AUTH=true npx @modelcontextprotocol/inspector node --input-type=module -e \"import fs from 'node:fs'; import { spawn } from 'node:child_process'; let child=null; const start=()=>{ child=spawn(process.execPath,['build/index.js'],{stdio:['pipe','pipe','inherit']}); process.stdin.pipe(child.stdin,{end:false}); child.stdout.pipe(process.stdout,{end:false}); child.on('exit',()=>{}); }; const stop=()=>{ if(!child) return; try{ process.stdin.unpipe(child.stdin);}catch{} try{ child.stdout.unpipe(process.stdout);}catch{} try{ child.kill('SIGTERM'); }catch{} setTimeout(()=>{ try{ child.kill('SIGKILL'); }catch{} },1500).unref?.(); child=null; }; let t=null; const restart=()=>{ if(t) clearTimeout(t); t=setTimeout(()=>{ console.error('[dev] build/index.js mudou — reiniciando servidor MCP...'); stop(); start(); },150); }; start(); fs.watch('build/index.js', { persistent:true }, ()=> restart());\"",
+    "inspector:noauth": "DANGEROUSLY_OMIT_AUTH=true npx @modelcontextprotocol/inspector build/index.js",
+    "mcp:smoke": "node --input-type=module -e \"import { Client } from '@modelcontextprotocol/sdk/client/index.js'; import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'; const client=new Client({name:'piperun-smoke',version:'0.0.0'},{capabilities:{}}); const transport=new StdioClientTransport({command:'node',args:['build/index.js']}); await client.connect(transport); const tools=await client.listTools(); console.log(JSON.stringify(tools,null,2)); await client.close();\""  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "0.6.0",
     "axios": "^1.8.4"
