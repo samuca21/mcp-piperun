@@ -1,5 +1,13 @@
 {
+  "name": "mcp-piperun",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:resolve-deal-owner": "node scripts/test_resolve_deal_owner.js --help || true"
+  },
   "dependencies": {
-    "axios": "^1.8.4"
+    "axios": "^1.8.4",
+    "node-fetch": "^3.4.1"
   }
 }
+
