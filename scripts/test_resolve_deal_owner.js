@@ -117,4 +117,5 @@ function normalizeName(s) { return (s || '').toString().trim().toLowerCase(); }
     if (u) ownerName = u.name;
   }
 
-  console.log
+  console.log(JSON.stringify({ deal: resolvedDeal, pipeline: { id: resolvedDeal.pipeline_id, name: pipelineName || null }, owner: { id: resolvedDeal.owner_id, name: ownerName || null } }, null, 2));
+})();
