@@ -1748,8 +1748,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         // Resolve deal
         let deal: any = null;
-        if (typeof dealId === "number") {
-          const resp = await axiosInstance.get(`/deals/${dealId}`, { headers: requestHeaders });
+        if (typeof dealIdIn === "number") {
+          const resp = await axiosInstance.get(`/deals/${dealIdIn}`, { headers: requestHeaders });
           deal = (resp.data as any)?.data ?? resp.data;
         } else if (dealTitleIn) {
           // list deals and find best match by title
@@ -1783,10 +1783,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         // Enriquecer com pipeline/owner names se possível
         const resolvedDeal = {
-          id: deal.id ?? dealIdIn,
-          title: deal.title ?? deal?.name ?? null,
-          pipeline_id: deal.pipeline_id ?? pipelineId ?? null,
-          owner_id: deal.owner_id ?? ownerId ?? null,
+          id: (deal && ((deal.id ?? (deal.data && deal.data.id)) as number)) ?? dealIdIn ?? null,
+          title: (deal && (deal.title ?? deal.name ?? (deal.data && deal.data.title) ?? null)) ?? null,
+          pipeline_id: (deal && (deal.pipeline_id ?? (deal.data && deal.data.pipeline_id))) ?? pipelineId ?? null,
+          owner_id: (deal && (deal.owner_id ?? (deal.data && deal.data.owner_id))) ?? ownerId ?? null,
         };
 
         if (!pipelineName && resolvedDeal.pipeline_id) {
