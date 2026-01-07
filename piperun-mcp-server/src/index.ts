@@ -140,6 +140,20 @@ function stableHash(str: string): number {
   return Math.abs(h >>> 0);
 }
 
+// Normaliza datas para formato Y-m-d (YYYY-MM-DD) exigido pela API PipeRun
+function formatDateToYmd(val: any): string {
+  const s = val === undefined || val === null ? "" : String(val).trim();
+  if (!s) throw new McpError(ErrorCode.InvalidParams, `Data inválida ou vazia: ${s}`);
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) {
+    throw new McpError(ErrorCode.InvalidParams, `Data inválida: ${s}. Aguarde formato ISO ou YYYY-MM-DD.`);
+  }
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 // Interface para validação dos argumentos de create_person
 interface CreatePersonArgs {
   name: string;
@@ -1377,7 +1391,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         if (typeof toolArgs.status !== "number") {
           throw new McpError(ErrorCode.InvalidParams, "O campo 'status' (number) é obrigatório.");
         }
-        const response = await axiosInstance.post("/activities", toolArgs, {
+        const activityPayload: any = { ...toolArgs };
+        if (typeof activityPayload.start_at === "string" && activityPayload.start_at.trim()) {
+          activityPayload.start_at = formatDateToYmd(activityPayload.start_at);
+        }
+        if (typeof activityPayload.end_at === "string" && activityPayload.end_at.trim()) {
+          activityPayload.end_at = formatDateToYmd(activityPayload.end_at);
+        }
+
+        const response = await axiosInstance.post("/activities", activityPayload, {
           headers: requestHeaders,
         });
         return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
@@ -1393,6 +1415,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         if (Object.keys(updateData).length === 0) {
           throw new McpError(ErrorCode.InvalidParams, "Nenhum dado fornecido para atualizar (além do activity_id).");
+        }
+
+        if (typeof updateData.start_at === "string" && updateData.start_at.trim()) {
+          updateData.start_at = formatDateToYmd(updateData.start_at);
+        }
+        if (typeof updateData.end_at === "string" && updateData.end_at.trim()) {
+          updateData.end_at = formatDateToYmd(updateData.end_at);
         }
 
         const response = await axiosInstance.put(`/activities/${activity_id}`, updateData, {
@@ -1680,6 +1709,113 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
       }
 
+      case "resolve_deal_owner": {
+        // Retorna dados enriquecidos do deal/pipeline/owner a partir de ids ou nomes
+        const dealIdIn = typeof toolArgs.deal_id === "number" ? toolArgs.deal_id : undefined;
+        const dealTitleIn = typeof toolArgs.deal_title === "string" && toolArgs.deal_title.trim() ? toolArgs.deal_title.trim() : undefined;
+        const pipelineIdIn = typeof toolArgs.pipeline_id === "number" ? toolArgs.pipeline_id : undefined;
+        const pipelineNameIn = typeof toolArgs.pipeline_name === "string" && toolArgs.pipeline_name.trim() ? toolArgs.pipeline_name.trim() : undefined;
+        const ownerIdIn = typeof toolArgs.owner_id === "number" ? toolArgs.owner_id : undefined;
+        const ownerNameIn = typeof toolArgs.owner_name === "string" && toolArgs.owner_name.trim() ? toolArgs.owner_name.trim() : undefined;
+
+        // Helpers to fetch lists
+        const pipelines = await listAllPages<any>({ endpoint: "/pipelines", params: {}, headers: requestHeaders, maxPages: 5, show: 200 });
+        const users = await listAllPages<any>({ endpoint: "/users", params: {}, headers: requestHeaders, maxPages: 5, show: 200 });
+
+        // Resolve pipeline id/name
+        let pipelineId: number | undefined = pipelineIdIn;
+        let pipelineName: string | undefined = pipelineNameIn;
+        if (!pipelineId && pipelineNameIn) {
+          const found = pipelines.find((p) => (p?.name || "").toString().trim().toLowerCase() === pipelineNameIn.toLowerCase());
+          if (found && typeof found.id === "number") pipelineId = found.id;
+        }
+        if (!pipelineName && pipelineId) {
+          const found = pipelines.find((p) => p?.id === pipelineId);
+          if (found) pipelineName = String(found.name || "").trim();
+        }
+
+        // Resolve owner id/name
+        let ownerId: number | undefined = ownerIdIn;
+        let ownerName: string | undefined = ownerNameIn;
+        if (!ownerId && ownerNameIn) {
+          const found = users.find((u) => ((u?.name || "") as string).toLowerCase().trim() === ownerNameIn.toLowerCase());
+          if (found && typeof found.id === "number") ownerId = found.id;
+        }
+        if (!ownerName && ownerId) {
+          const found = users.find((u) => u?.id === ownerId);
+          if (found) ownerName = String(found.name || "").trim();
+        }
+
+        // Resolve deal
+        let deal: any = null;
+        if (typeof dealId === "number") {
+          const resp = await axiosInstance.get(`/deals/${dealId}`, { headers: requestHeaders });
+          deal = (resp.data as any)?.data ?? resp.data;
+        } else if (dealTitleIn) {
+          // list deals and find best match by title
+          const deals = await listAllPages<any>({ endpoint: "/deals", params: {}, headers: requestHeaders, maxPages: 5, show: 200 });
+          const titleLower = dealTitleIn.toLowerCase();
+          let found = deals.find((d) => ((d?.title || "") as string).toLowerCase().trim() === titleLower);
+          if (!found) found = deals.find((d) => ((d?.title || "") as string).toLowerCase().includes(titleLower));
+          if (!found && pipelineId) {
+            found = deals.find((d) => d?.pipeline_id === pipelineId && ((d?.title || "") as string).toLowerCase().includes(titleLower));
+          }
+          if (found) deal = found;
+          // otherwise as fallback, if ownerId provided, pick most recent deal for that owner
+          if (!deal && ownerId) {
+            const deals = await listAllPages<any>({ endpoint: "/deals", params: {}, headers: requestHeaders, maxPages: 5, show: 200 });
+            const foundByOwner = deals.find((d) => d?.owner_id === ownerId);
+            if (foundByOwner) deal = foundByOwner;
+          }
+        } else if (pipelineId) {
+          // pick most recent deal in pipeline
+          const deals = await listAllPages<any>({ endpoint: "/deals", params: { pipeline_id: pipelineId }, headers: requestHeaders, maxPages: 5, show: 200 });
+          if (deals.length > 0) deal = deals[0];
+        } else if (ownerId) {
+          const deals = await listAllPages<any>({ endpoint: "/deals", params: {}, headers: requestHeaders, maxPages: 5, show: 200 });
+          const found = deals.find((d) => d?.owner_id === ownerId);
+          if (found) deal = found;
+        }
+
+        if (!deal) {
+          throw new McpError(ErrorCode.InvalidParams, "Não foi possível localizar uma oportunidade com os parâmetros fornecidos.");
+        }
+
+        // Enriquecer com pipeline/owner names se possível
+        const resolvedDeal = {
+          id: deal.id ?? dealIdIn,
+          title: deal.title ?? deal?.name ?? null,
+          pipeline_id: deal.pipeline_id ?? pipelineId ?? null,
+          owner_id: deal.owner_id ?? ownerId ?? null,
+        };
+
+        if (!pipelineName && resolvedDeal.pipeline_id) {
+          const p = pipelines.find((x) => x?.id === resolvedDeal.pipeline_id);
+          if (p) pipelineName = String(p.name || "").trim();
+        }
+        if (!ownerName && resolvedDeal.owner_id) {
+          const u = users.find((x) => x?.id === resolvedDeal.owner_id);
+          if (u) ownerName = String(u.name || "").trim();
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  deal: resolvedDeal,
+                  pipeline: { id: resolvedDeal.pipeline_id ?? null, name: pipelineName ?? null },
+                  owner: { id: resolvedDeal.owner_id ?? null, name: ownerName ?? null },
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
       case "upsert_company_by_domain_or_name": {
         const maxPages = typeof toolArgs.max_pages === "number" ? toolArgs.max_pages : 5;
         const show = typeof toolArgs.show === "number" ? toolArgs.show : 200;
@@ -1811,8 +1947,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           status: typeof toolArgs.status === "number" ? toolArgs.status : 0,
         };
         if (typeof toolArgs.owner_id === "number") payload.owner_id = toolArgs.owner_id;
-        if (typeof toolArgs.start_at === "string" && toolArgs.start_at.trim()) payload.start_at = toolArgs.start_at;
-        if (typeof toolArgs.end_at === "string" && toolArgs.end_at.trim()) payload.end_at = toolArgs.end_at;
+        if (typeof toolArgs.start_at === "string" && toolArgs.start_at.trim()) payload.start_at = formatDateToYmd(toolArgs.start_at);
+        if (typeof toolArgs.end_at === "string" && toolArgs.end_at.trim()) payload.end_at = formatDateToYmd(toolArgs.end_at);
         if (typeof toolArgs.description === "string") payload.description = toolArgs.description;
 
         const response = await axiosInstance.post("/activities", payload, { headers: requestHeaders });
@@ -2000,8 +2136,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             status: typeof f.status === "number" ? f.status : 0,
           };
           if (typeof f.owner_id === "number") activityPayload.owner_id = f.owner_id;
-          if (typeof f.start_at === "string" && f.start_at.trim()) activityPayload.start_at = f.start_at;
-          if (typeof f.end_at === "string" && f.end_at.trim()) activityPayload.end_at = f.end_at;
+          if (typeof f.start_at === "string" && f.start_at.trim()) activityPayload.start_at = formatDateToYmd(f.start_at);
+          if (typeof f.end_at === "string" && f.end_at.trim()) activityPayload.end_at = formatDateToYmd(f.end_at);
           if (typeof f.description === "string") activityPayload.description = f.description;
 
           if (typeof toolArgs.deal_id === "number") activityPayload.deal_id = toolArgs.deal_id;
@@ -2271,8 +2407,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           };
           if (typeof m.owner_id === "number") payload.owner_id = m.owner_id;
           else if (typeof dealOwnerId === "number") payload.owner_id = dealOwnerId;
-          if (typeof m.start_at === "string" && m.start_at.trim()) payload.start_at = m.start_at;
-          if (typeof m.end_at === "string" && m.end_at.trim()) payload.end_at = m.end_at;
+          if (typeof m.start_at === "string" && m.start_at.trim()) payload.start_at = formatDateToYmd(m.start_at);
+          if (typeof m.end_at === "string" && m.end_at.trim()) payload.end_at = formatDateToYmd(m.end_at);
           if (typeof m.description === "string") payload.description = m.description;
 
           createdMeeting = (await axiosInstance.post("/activities", payload, { headers: requestHeaders })).data;
@@ -2290,8 +2426,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           };
           if (typeof f.owner_id === "number") payload.owner_id = f.owner_id;
           else if (typeof dealOwnerId === "number") payload.owner_id = dealOwnerId;
-          if (typeof f.start_at === "string" && f.start_at.trim()) payload.start_at = f.start_at;
-          if (typeof f.end_at === "string" && f.end_at.trim()) payload.end_at = f.end_at;
+          if (typeof f.start_at === "string" && f.start_at.trim()) payload.start_at = formatDateToYmd(f.start_at);
+          if (typeof f.end_at === "string" && f.end_at.trim()) payload.end_at = formatDateToYmd(f.end_at);
           if (typeof f.description === "string") payload.description = f.description;
 
           createdFollowup = (await axiosInstance.post("/activities", payload, { headers: requestHeaders })).data;
