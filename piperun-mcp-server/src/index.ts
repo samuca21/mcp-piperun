@@ -705,6 +705,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             phone: { type: "string", description: "(Opcional) Telefone principal da empresa" },
           },
           required: ["name", "owner_id"],
+          additionalProperties: true,
         },
       },
       {
@@ -1474,14 +1475,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             "Argumentos inválidos para create_person. 'name' (string) e 'owner_id' (number) são obrigatórios."
           );
         }
-        const personData: Partial<CreatePersonArgs> = {
-          name: toolArgs.name,
-          owner_id: toolArgs.owner_id,
-          ...(toolArgs.email ? { email: toolArgs.email } : {}),
-          ...(toolArgs.phone ? { phone: toolArgs.phone } : {}),
-          ...(toolArgs.company_id ? { company_id: toolArgs.company_id } : {}),
-        };
-        const response = await axiosInstance.post("/persons", personData, {
+
+        const payload: Record<string, any> = { ...toolArgs };
+        payload.name = toolArgs.name.trim();
+        payload.owner_id = toolArgs.owner_id;
+        if (typeof payload.email === "string") payload.email = payload.email.trim();
+        if (typeof payload.phone === "string") payload.phone = payload.phone.trim();
+
+        const response = await axiosInstance.post("/persons", payload, {
           headers: requestHeaders,
         });
         return {
@@ -1556,7 +1557,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "create_company": {
-        const response = await axiosInstance.post("/companies", toolArgs, {
+        if (typeof toolArgs.name !== "string" || !toolArgs.name.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'name' (string) é obrigatório.");
+        }
+        if (typeof toolArgs.owner_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O campo 'owner_id' (number) é obrigatório.");
+        }
+
+        const payload: Record<string, any> = { ...toolArgs };
+        payload.name = toolArgs.name.trim();
+        if (typeof payload.email === "string") payload.email = payload.email.trim();
+        if (typeof payload.phone === "string") payload.phone = payload.phone.trim();
+
+        const response = await axiosInstance.post("/companies", payload, {
           headers: requestHeaders,
         });
         return {
@@ -1602,6 +1615,477 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         });
         return {
           content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }],
+        };
+      }
+
+      case "route_lead_to_owner": {
+        if (typeof toolArgs.key !== "string" || !toolArgs.key.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'key' (string) é obrigatório.");
+        }
+        if (!Array.isArray(toolArgs.candidates_owner_ids) || toolArgs.candidates_owner_ids.length === 0) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "O parâmetro 'candidates_owner_ids' (array de integers) é obrigatório e não pode ser vazio."
+          );
+        }
+
+        const candidates = (toolArgs.candidates_owner_ids as any[])
+          .map((x) => {
+            if (typeof x === "number") return x;
+            if (typeof x === "string" && x.trim() !== "" && !Number.isNaN(Number(x))) return Number(x);
+            return null;
+          })
+          .filter((x): x is number => typeof x === "number");
+        if (candidates.length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, "'candidates_owner_ids' deve conter ao menos um number válido.");
+        }
+
+        const key = toolArgs.key.trim();
+        const idx = stableHash(key) % candidates.length;
+        const owner_id = candidates[idx];
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  key,
+                  owner_id,
+                  index: idx,
+                  candidates_owner_ids: candidates,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "assign_deal_owner": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        if (typeof toolArgs.owner_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'owner_id' (number) é obrigatório.");
+        }
+
+        const response = await axiosInstance.put(
+          `/deals/${toolArgs.deal_id}`,
+          { owner_id: toolArgs.owner_id },
+          { headers: requestHeaders }
+        );
+
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "upsert_company_by_domain_or_name": {
+        const maxPages = typeof toolArgs.max_pages === "number" ? toolArgs.max_pages : 5;
+        const show = typeof toolArgs.show === "number" ? toolArgs.show : 200;
+
+        const nameIn = typeof toolArgs.name === "string" ? toolArgs.name.trim() : "";
+        const domainIn = typeof toolArgs.domain === "string" ? toolArgs.domain.trim() : "";
+
+        if (!nameIn && !domainIn) {
+          throw new McpError(ErrorCode.InvalidParams, "Informe 'name' e/ou 'domain' para buscar empresa.");
+        }
+
+        const companies = await listAllPages<any>({
+          endpoint: "/companies",
+          params: {},
+          headers: requestHeaders,
+          maxPages,
+          show,
+        });
+
+        const found = companies.find((c) => findCompanyMatch(c, domainIn || undefined, nameIn || undefined));
+        if (found && typeof (found as any)?.id === "number") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ action: "matched", company: found }, null, 2),
+              },
+            ],
+          };
+        }
+
+        if (!nameIn) {
+          throw new McpError(ErrorCode.InvalidParams, "Empresa não encontrada. Para criar, informe 'name'.");
+        }
+        if (typeof toolArgs.owner_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Empresa não encontrada. Para criar, informe 'owner_id' (number)."
+          );
+        }
+
+        const payload: any = { name: nameIn, owner_id: toolArgs.owner_id };
+        if (typeof toolArgs.email === "string" && toolArgs.email.trim()) payload.email = toolArgs.email.trim();
+        if (typeof toolArgs.phone === "string" && toolArgs.phone.trim()) payload.phone = toolArgs.phone.trim();
+        if (domainIn) payload.website = domainIn;
+
+        const created = await axiosInstance.post("/companies", payload, { headers: requestHeaders });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ action: "created", company: created.data }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "upsert_person_by_email_or_phone": {
+        const maxPages = typeof toolArgs.max_pages === "number" ? toolArgs.max_pages : 5;
+        const show = typeof toolArgs.show === "number" ? toolArgs.show : 200;
+
+        const nameIn = typeof toolArgs.name === "string" ? toolArgs.name.trim() : "";
+        const emailIn = typeof toolArgs.email === "string" ? toolArgs.email.trim() : "";
+        const phoneIn = typeof toolArgs.phone === "string" ? toolArgs.phone.trim() : "";
+
+        if (!emailIn && !phoneIn && !nameIn) {
+          throw new McpError(ErrorCode.InvalidParams, "Informe ao menos 'email', 'phone' ou 'name' para buscar pessoa.");
+        }
+
+        const persons = await listAllPages<any>({
+          endpoint: "/persons",
+          params: {},
+          headers: requestHeaders,
+          maxPages,
+          show,
+        });
+
+        const found = persons.find((p) => findPersonMatch(p, emailIn || undefined, phoneIn || undefined));
+        if (found && typeof (found as any)?.id === "number") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ action: "matched", person: found }, null, 2),
+              },
+            ],
+          };
+        }
+
+        if (!nameIn) {
+          throw new McpError(ErrorCode.InvalidParams, "Pessoa não encontrada. Para criar, informe 'name'.");
+        }
+        if (typeof toolArgs.owner_id !== "number") {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Pessoa não encontrada. Para criar, informe 'owner_id' (number)."
+          );
+        }
+
+        const payload: any = { name: nameIn, owner_id: toolArgs.owner_id };
+        if (emailIn) payload.email = emailIn;
+        if (phoneIn) payload.phone = phoneIn;
+        if (typeof toolArgs.company_id === "number") payload.company_id = toolArgs.company_id;
+
+        const created = await axiosInstance.post("/persons", payload, { headers: requestHeaders });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ action: "created", person: created.data }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "create_meeting_activity_for_deal": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        if (typeof toolArgs.title !== "string" || !toolArgs.title.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'title' (string) é obrigatório.");
+        }
+
+        const payload: any = {
+          title: toolArgs.title.trim(),
+          deal_id: toolArgs.deal_id,
+          activity_type_id:
+            typeof toolArgs.activity_type_id === "number" ? toolArgs.activity_type_id : ACTIVITY_TYPE_MEETING_ID_DEFAULT,
+          status: typeof toolArgs.status === "number" ? toolArgs.status : 0,
+        };
+        if (typeof toolArgs.owner_id === "number") payload.owner_id = toolArgs.owner_id;
+        if (typeof toolArgs.start_at === "string" && toolArgs.start_at.trim()) payload.start_at = toolArgs.start_at;
+        if (typeof toolArgs.end_at === "string" && toolArgs.end_at.trim()) payload.end_at = toolArgs.end_at;
+        if (typeof toolArgs.description === "string") payload.description = toolArgs.description;
+
+        const response = await axiosInstance.post("/activities", payload, { headers: requestHeaders });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "create_opportunity_bundle": {
+        // Deal obrigatório
+        if (typeof toolArgs.title !== "string" || !toolArgs.title.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "'title' (string) é obrigatório.");
+        }
+        if (typeof toolArgs.pipeline_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "'pipeline_id' (number) é obrigatório.");
+        }
+        if (typeof toolArgs.stage_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "'stage_id' (number) é obrigatório.");
+        }
+
+        const maxPages = typeof toolArgs.max_pages === "number" ? toolArgs.max_pages : 5;
+        const show = typeof toolArgs.show === "number" ? toolArgs.show : 200;
+
+        // Company upsert (optional)
+        let companyId: number | undefined = typeof toolArgs.company_id === "number" ? toolArgs.company_id : undefined;
+        let companyResult: any = null;
+
+        const companyName = typeof toolArgs.company_name === "string" ? toolArgs.company_name.trim() : "";
+        const companyDomain = typeof toolArgs.company_domain === "string" ? toolArgs.company_domain.trim() : "";
+
+        if (!companyId && (companyName || companyDomain)) {
+          const companies = await listAllPages<any>({
+            endpoint: "/companies",
+            params: {},
+            headers: requestHeaders,
+            maxPages,
+            show,
+          });
+
+          const foundCompany = companies.find((c) => findCompanyMatch(c, companyDomain || undefined, companyName || undefined));
+          if (foundCompany && typeof (foundCompany as any)?.id === "number") {
+            companyId = (foundCompany as any).id;
+            companyResult = { action: "matched", company: foundCompany };
+          } else {
+            if (!companyName) {
+              throw new McpError(ErrorCode.InvalidParams, "Empresa não encontrada. Para criar, informe 'company_name'.");
+            }
+            if (typeof toolArgs.company_owner_id !== "number") {
+              throw new McpError(ErrorCode.InvalidParams, "Empresa não encontrada. Para criar, informe 'company_owner_id'.");
+            }
+
+            const payload: any = { name: companyName, owner_id: toolArgs.company_owner_id };
+            if (typeof toolArgs.company_email === "string" && toolArgs.company_email.trim()) payload.email = toolArgs.company_email.trim();
+            if (typeof toolArgs.company_phone === "string" && toolArgs.company_phone.trim()) payload.phone = toolArgs.company_phone.trim();
+            if (companyDomain) payload.website = companyDomain;
+
+            const createdCompany = await axiosInstance.post("/companies", payload, { headers: requestHeaders });
+            const createdCompanyId = (createdCompany.data as any)?.data?.id ?? (createdCompany.data as any)?.id;
+            if (typeof createdCompanyId === "number") companyId = createdCompanyId;
+            companyResult = { action: "created", company: createdCompany.data };
+          }
+        }
+
+        // Person upsert (optional)
+        let personId: number | undefined = typeof toolArgs.person_id === "number" ? toolArgs.person_id : undefined;
+        let personResult: any = null;
+
+        const personName = typeof toolArgs.person_name === "string" ? toolArgs.person_name.trim() : "";
+        const personEmail = typeof toolArgs.person_email === "string" ? toolArgs.person_email.trim() : "";
+        const personPhone = typeof toolArgs.person_phone === "string" ? toolArgs.person_phone.trim() : "";
+
+        if (!personId && (personName || personEmail || personPhone)) {
+          const persons = await listAllPages<any>({
+            endpoint: "/persons",
+            params: {},
+            headers: requestHeaders,
+            maxPages,
+            show,
+          });
+
+          const foundPerson = persons.find((p) => findPersonMatch(p, personEmail || undefined, personPhone || undefined));
+          if (foundPerson && typeof (foundPerson as any)?.id === "number") {
+            personId = (foundPerson as any).id;
+            personResult = { action: "matched", person: foundPerson };
+          } else {
+            if (!personName) {
+              throw new McpError(ErrorCode.InvalidParams, "Pessoa não encontrada. Para criar, informe 'person_name'.");
+            }
+            if (typeof toolArgs.person_owner_id !== "number") {
+              throw new McpError(ErrorCode.InvalidParams, "Pessoa não encontrada. Para criar, informe 'person_owner_id'.");
+            }
+
+            const payload: any = { name: personName, owner_id: toolArgs.person_owner_id };
+            if (personEmail) payload.email = personEmail;
+            if (personPhone) payload.phone = personPhone;
+            if (companyId) payload.company_id = companyId;
+
+            const createdPerson = await axiosInstance.post("/persons", payload, { headers: requestHeaders });
+            const createdPersonId = (createdPerson.data as any)?.data?.id ?? (createdPerson.data as any)?.id;
+            if (typeof createdPersonId === "number") personId = createdPersonId;
+            personResult = { action: "created", person: createdPerson.data };
+          }
+        }
+
+        // Create deal
+        const dealPayload: any = {
+          title: toolArgs.title.trim(),
+          pipeline_id: toolArgs.pipeline_id,
+          stage_id: toolArgs.stage_id,
+        };
+        if (typeof toolArgs.value === "number") dealPayload.value = toolArgs.value;
+        if (typeof toolArgs.owner_id === "number") dealPayload.owner_id = toolArgs.owner_id;
+        if (personId) dealPayload.person_id = personId;
+        if (companyId) dealPayload.company_id = companyId;
+
+        const createdDeal = await axiosInstance.post("/deals", dealPayload, { headers: requestHeaders });
+        const dealId = (createdDeal.data as any)?.data?.id ?? (createdDeal.data as any)?.id;
+
+        // Note (optional)
+        let createdNote: any = null;
+        if (typeof toolArgs.note_content === "string" && toolArgs.note_content.trim() && typeof dealId === "number") {
+          createdNote = (
+            await axiosInstance.post(
+              "/notes",
+              { content: toolArgs.note_content.trim(), deal_id: dealId },
+              { headers: requestHeaders }
+            )
+          ).data;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  company: companyResult,
+                  person: personResult,
+                  deal: createdDeal.data,
+                  deal_id: dealId,
+                  note: createdNote,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "log_outbound_call_and_outcome": {
+        // 1) optional call
+        let createdCall: any = null;
+        if (toolArgs.call_body && typeof toolArgs.call_body === "object") {
+          createdCall = (await axiosInstance.post("/calls", toolArgs.call_body, { headers: requestHeaders })).data;
+        }
+
+        // 2) note is required by schema
+        if (typeof toolArgs.note_content !== "string" || !toolArgs.note_content.trim()) {
+          throw new McpError(ErrorCode.InvalidParams, "'note_content' (string) é obrigatório.");
+        }
+
+        const notePayload: any = { content: toolArgs.note_content.trim() };
+        if (typeof toolArgs.deal_id === "number") notePayload.deal_id = toolArgs.deal_id;
+        else if (typeof toolArgs.person_id === "number") notePayload.person_id = toolArgs.person_id;
+        else if (typeof toolArgs.company_id === "number") notePayload.company_id = toolArgs.company_id;
+        else {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Para criar nota, informe um vínculo: 'deal_id' ou 'person_id' ou 'company_id'."
+          );
+        }
+
+        const createdNote = (await axiosInstance.post("/notes", notePayload, { headers: requestHeaders })).data;
+
+        // 3) optional follow-up activity
+        let createdFollowup: any = null;
+        if (toolArgs.followup && typeof toolArgs.followup === "object") {
+          const f = toolArgs.followup as any;
+          if (typeof f.title !== "string" || !f.title.trim()) {
+            throw new McpError(ErrorCode.InvalidParams, "followup.title (string) é obrigatório.");
+          }
+
+          const activityPayload: any = {
+            title: f.title.trim(),
+            activity_type_id: typeof f.activity_type_id === "number" ? f.activity_type_id : ACTIVITY_TYPE_CALL_ID_DEFAULT,
+            status: typeof f.status === "number" ? f.status : 0,
+          };
+          if (typeof f.owner_id === "number") activityPayload.owner_id = f.owner_id;
+          if (typeof f.start_at === "string" && f.start_at.trim()) activityPayload.start_at = f.start_at;
+          if (typeof f.end_at === "string" && f.end_at.trim()) activityPayload.end_at = f.end_at;
+          if (typeof f.description === "string") activityPayload.description = f.description;
+
+          if (typeof toolArgs.deal_id === "number") activityPayload.deal_id = toolArgs.deal_id;
+          if (typeof toolArgs.person_id === "number") activityPayload.person_id = toolArgs.person_id;
+          if (typeof toolArgs.company_id === "number") activityPayload.company_id = toolArgs.company_id;
+
+          createdFollowup = (await axiosInstance.post("/activities", activityPayload, { headers: requestHeaders })).data;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  call: createdCall,
+                  note: createdNote,
+                  followup: createdFollowup,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "complete_activity_with_notes": {
+        if (typeof toolArgs.activity_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'activity_id' (number) é obrigatório.");
+        }
+
+        // 1) complete activity
+        const completed = await axiosInstance.put(
+          `/activities/${toolArgs.activity_id}`,
+          { status: 2 },
+          { headers: requestHeaders }
+        );
+
+        // 2) optional note
+        let createdNote: any = null;
+        if (typeof toolArgs.note_content === "string" && toolArgs.note_content.trim()) {
+          // Try to resolve association
+          let dealId: number | undefined = typeof toolArgs.deal_id === "number" ? toolArgs.deal_id : undefined;
+          let personId: number | undefined = typeof toolArgs.person_id === "number" ? toolArgs.person_id : undefined;
+          let companyId: number | undefined = typeof toolArgs.company_id === "number" ? toolArgs.company_id : undefined;
+
+          if (!dealId && !personId && !companyId) {
+            // fetch activity details to infer
+            try {
+              const act = await axiosInstance.get(`/activities/${toolArgs.activity_id}`, { headers: requestHeaders });
+              const d = (act.data as any)?.data ?? act.data;
+              if (typeof d?.deal_id === "number") dealId = d.deal_id;
+              if (typeof d?.person_id === "number") personId = d.person_id;
+              if (typeof d?.company_id === "number") companyId = d.company_id;
+            } catch (_) {
+              // ignore
+            }
+          }
+
+          const notePayload: any = { content: toolArgs.note_content.trim() };
+          if (dealId) notePayload.deal_id = dealId;
+          else if (personId) notePayload.person_id = personId;
+          else if (companyId) notePayload.company_id = companyId;
+
+          if (notePayload.deal_id || notePayload.person_id || notePayload.company_id) {
+            createdNote = (await axiosInstance.post("/notes", notePayload, { headers: requestHeaders })).data;
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  activity: completed.data,
+                  note: createdNote,
+                },
+                null,
+                2
+              ),
+            },
+          ],
         };
       }
 
