@@ -3,11 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test:resolve-deal-owner": "node scripts/test_resolve_deal_owner.js --help || true"
+    "test:resolve-deal-owner": "node scripts/test_resolve_deal_owner.js --help || true",
+    "test:proposals": "node scripts/test_proposals.js --help || true"
   },
   "dependencies": {
     "axios": "^1.8.4",
-    "node-fetch": "^3.4.1"
+    "form-data": "^4.0.0",
+    "axios": "^1.8.4"
   }
 }
 

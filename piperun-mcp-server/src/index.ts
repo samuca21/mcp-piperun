@@ -11,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import axios, { AxiosError } from "axios";
+import FormData from "form-data";
 
 // IMPORTANTE (MCP stdio): qualquer saída em stdout quebra o protocolo.
 // Forçamos logs para stderr para evitar que dependências usem stdout.
@@ -755,6 +756,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       { name: "list_loss_reasons", description: "Recupera uma lista de motivos de perda do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
       { name: "list_deal_sources", description: "Recupera uma lista de origens de oportunidades do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
       { name: "list_activity_types", description: "Recupera uma lista de tipos de atividades do PipeRun CRM.", inputSchema: listToolSimpleInputSchema },
+      // Proposals (Propostas)
+      {
+        name: "list_proposals",
+        description: "Recupera uma lista de propostas (proposals).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string", description: "(Opcional) Token da API do PipeRun." },
+            page: { type: "number" },
+            show: { type: "number" },
+            deal_id: { type: "number", description: "(Opcional) Filtrar por deal_id" }
+          },
+          required: [] as string[],
+        },
+      },
+      {
+        name: "get_proposal",
+        description: "Recupera os detalhes de uma proposta pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            proposal_id: { type: "number" }
+          },
+          required: ["proposal_id"],
+        },
+      },
+      {
+        name: "list_proposals_for_deal",
+        description: "Lista propostas vinculadas a um deal específico.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            deal_id: { type: "number" },
+            page: { type: "number" },
+            show: { type: "number" }
+          },
+          required: ["deal_id"],
+        },
+      },
+      {
+        name: "create_proposal",
+        description: "Cria uma proposta. Suporta payload JSON e anexos (attachments: [{filename,content_base64}]).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            deal_id: { type: "number", description: "(Opcional) ID do deal. Se informado, usa POST /deals/{deal_id}/proposals quando apropriado." },
+            proposal: { type: "object", description: "Objeto da proposta conforme API PipeRun", additionalProperties: true },
+            attachments: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  filename: { type: "string" },
+                  content_base64: { type: "string" }
+                },
+                required: ["filename", "content_base64"]
+              }
+            }
+          },
+          required: ["proposal"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "update_proposal",
+        description: "Atualiza uma proposta existente.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            proposal_id: { type: "number" },
+            proposal: { type: "object", additionalProperties: true }
+          },
+          required: ["proposal_id", "proposal"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "delete_proposal",
+        description: "Remove uma proposta pelo ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            proposal_id: { type: "number" }
+          },
+          required: ["proposal_id"]
+        },
+      },
+      {
+        name: "generate_proposal_pdf",
+        description: "Gera PDF de proposta a partir do hash retornado (PUT /proposals/generatePdf/{hash}).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            api_token: { type: "string" },
+            hash: { type: "string" }
+          },
+          required: ["hash"]
+        },
+      },
 
       // Notas
       {
@@ -1814,6 +1919,91 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             },
           ],
         };
+      }
+
+      // ===== Proposals (Propostas) =====
+      case "list_proposals": {
+        const response = await axiosInstance.get("/proposals", {
+          params: toolArgs,
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "get_proposal": {
+        if (typeof toolArgs.proposal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'proposal_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/proposals/${toolArgs.proposal_id}`, { headers: requestHeaders });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "list_proposals_for_deal": {
+        if (typeof toolArgs.deal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'deal_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.get(`/deals/${toolArgs.deal_id}/proposals`, {
+          params: toolArgs,
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "create_proposal": {
+        if (!toolArgs.proposal || typeof toolArgs.proposal !== "object") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'proposal' (object) é obrigatório.");
+        }
+
+        // If attachments provided, send multipart/form-data
+        const attachments = Array.isArray(toolArgs.attachments) ? toolArgs.attachments : null;
+        const url = typeof toolArgs.deal_id === "number" ? `/deals/${toolArgs.deal_id}/proposals` : "/proposals";
+
+        if (attachments && attachments.length > 0) {
+          const form = new FormData();
+          form.append("proposal", JSON.stringify(toolArgs.proposal));
+          for (const att of attachments) {
+            if (!att || typeof att.filename !== "string" || typeof att.content_base64 !== "string") continue;
+            const buf = Buffer.from(att.content_base64, "base64");
+            form.append("files[]", buf, { filename: att.filename });
+          }
+
+          const headers = { ...requestHeaders, ...form.getHeaders() };
+          const response = await axiosInstance.post(url, form as any, { headers });
+          return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+        }
+
+        // No attachments: send JSON
+        const response = await axiosInstance.post(url, toolArgs.proposal, { headers: requestHeaders });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "update_proposal": {
+        if (typeof toolArgs.proposal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'proposal_id' (number) é obrigatório.");
+        }
+        if (!toolArgs.proposal || typeof toolArgs.proposal !== "object") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'proposal' (object) é obrigatório.");
+        }
+        const response = await axiosInstance.put(`/proposals/${toolArgs.proposal_id}`, toolArgs.proposal, {
+          headers: requestHeaders,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "delete_proposal": {
+        if (typeof toolArgs.proposal_id !== "number") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'proposal_id' (number) é obrigatório.");
+        }
+        const response = await axiosInstance.delete(`/proposals/${toolArgs.proposal_id}`, { headers: requestHeaders });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
+      }
+
+      case "generate_proposal_pdf": {
+        if (!toolArgs.hash || typeof toolArgs.hash !== "string") {
+          throw new McpError(ErrorCode.InvalidParams, "O parâmetro 'hash' (string) é obrigatório.");
+        }
+        const response = await axiosInstance.put(`/proposals/generatePdf/${encodeURIComponent(toolArgs.hash)}`, {}, { headers: requestHeaders });
+        return { content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }] };
       }
 
       case "upsert_company_by_domain_or_name": {
